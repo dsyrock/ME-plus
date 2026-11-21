@@ -1,0 +1,13 @@
+/build/
+/.vs/
+**/node_modules/
+**/.venv/
+**/__pycache__/
+*.user
+*.obj
+*.pdb
+.env
+.env.*
+!.env.example
+*.pfx
+*.key

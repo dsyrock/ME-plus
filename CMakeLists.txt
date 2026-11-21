@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.20)
+project(MEPlus LANGUAGES CXX)
+
+if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "ME+ requires 64-bit Windows and MSVC.")
+endif()
+
+add_library(reaper_meplus MODULE core/plugin.cpp)
+target_compile_features(reaper_meplus PRIVATE cxx_std_17)
+target_compile_options(reaper_meplus PRIVATE /utf-8 /W4)
+target_compile_definitions(reaper_meplus PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(reaper_meplus PRIVATE core)
+target_include_directories(reaper_meplus SYSTEM PRIVATE third_party/reaper)
+add_subdirectory(features)

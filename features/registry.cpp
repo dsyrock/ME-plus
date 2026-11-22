@@ -3,12 +3,12 @@
 namespace meplus {
 
 namespace audio_regions {
-bool load(HINSTANCE instance, reaper_plugin_info_t& host);
+bool load(REAPER_PLUGIN_HINSTANCE instance, reaper_plugin_info_t& host);
 void unload();
 }
 
 namespace waveform_thumbnails {
-bool load(HINSTANCE instance, reaper_plugin_info_t& host);
+bool load(REAPER_PLUGIN_HINSTANCE instance, reaper_plugin_info_t& host);
 void unload();
 }
 

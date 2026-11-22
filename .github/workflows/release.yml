@@ -37,7 +37,7 @@ jobs:
             plugin: reaper_ME+.dylib
             flags: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES=x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
       - run: cmake --build build --config Release --parallel 2
       - run: cmake --install build --config Release --prefix package
@@ -65,7 +65,7 @@ jobs:
         shell: bash
         working-directory: package
         run: cmake -E tar cf '../ME-plus-${{ matrix.platform }}.zip' --format=zip '${{ matrix.plugin }}'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
           path: ME-plus-${{ matrix.platform }}.zip
@@ -78,7 +78,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: release
           merge-multiple: true

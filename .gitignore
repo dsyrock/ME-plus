@@ -1,4 +1,6 @@
 /build/
+/incoming/*
+!/incoming/README.md
 /.vs/
 **/node_modules/
 **/.venv/

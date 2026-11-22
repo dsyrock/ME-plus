@@ -1,10 +1,15 @@
 # ME+
 
-ME+ 是 Windows x64 版 REAPER 的 Media Explorer 扩展合集。当前骨架可以独立编译和加载，功能模块将在收到源码后逐项接入。
+ME+ 是 Windows x64 版 REAPER 的 Media Explorer 扩展合集。
+
+- **波形缩略图**在文件列表的 `Waveform` 列绘制波形，并支持点击缩略图定位试听位置。
+- **可拖拽音频区段**检测试听素材中的音频区段，按住 Alt 在预览波形上显示区段，再把区段拖入工程。
+
+两个功能都可以在 Media Explorer 的动作列表中搜索 `ME+`，分别开启、关闭和设置。合并版沿用两个独立版的动作 ID 和设置键。
 
 ## 添加功能
 
-把每个新功能的原始源码放进 [incoming](incoming/) 下的单独目录。Lua 脚本和原有 C++ 工程都可以保留原结构。构建只包含已经接入的模块。
+把每个新功能的原始源码放进 [incoming](incoming/) 下的单独目录。Lua 脚本和原有 C++ 工程都可以保留原结构。ME+ 仓库和构建只收录已经接入的模块。当前模块源自音频区段项目的 `d2c0263` 和波形缩略图项目的 `3076f77`。
 
 维护者将适配后的代码放入 [features](features/)，在该目录的 `CMakeLists.txt` 中添加源文件，并在 `registry.cpp` 登记模块的加载和卸载函数。模块接口见 [core/feature.h](core/feature.h)。模块通过传入的 REAPER 接口注册动作和获取 API。动作的命名 ID 在后续版本中应保持稳定，以保留用户的快捷键绑定。
 
@@ -19,6 +24,6 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-生成的插件为 `build/Release/reaper_meplus.dll`。需要安装时，在 REAPER 的 Options 菜单中打开资源目录，退出目标实例，将 DLL 放进该资源目录的 `UserPlugins` 子目录，再启动 REAPER。
+生成的插件为 `build/Release/reaper_meplus.dll`。需要安装时，在 REAPER 的 Options 菜单中打开资源目录，退出目标实例。若已安装独立版，请先将 `reaper_audio_regions.dll` 和 `reaper_media_wave_thumbnails.dll` 移出 `UserPlugins`，避免重复注册动作和界面回调。将合并版 DLL 放入 `UserPlugins`，再启动 REAPER。
 
 项目随附构建所需的 Cockos SDK 头文件，版权和许可保留在文件开头。[REAPER Extensions SDK](https://www.reaper.fm/sdk/plugin/plugin.php)

@@ -128,7 +128,6 @@ void scanAudio() {
 
 void fill(HDC dc, RECT r, HBRUSH brush) { FillRect(dc, &r, brush); }
 #ifdef _WIN32
-constexpr COLORREF transparent = RGB(255,0,255);
 constexpr COLORREF dropColor = RGB(128,128,128);
 constexpr wchar_t className[] = L"ReaperAudioRegionStrip";
 HWND dropPreview;
@@ -169,29 +168,62 @@ int pixelAtFrame(Frame frame, WaveView view, bool right) {
 }
 void paint(HWND w) {
     PAINTSTRUCT ps{};
-    auto dc = BeginPaint(w,&ps);
-    RECT bounds{};
-    GetClientRect(w,&bounds);
-    auto key = CreateSolidBrush(transparent);
-    fill(dc,bounds,key);
-    DeleteObject(key);
+    BeginPaint(w,&ps);
+    EndPaint(w,&ps);
+    const int width = viewWidth;
+    const int height = waveformBottom;
+    if (width <= 0 || height <= 0) return;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    auto dc = CreateCompatibleDC(nullptr);
+    if (!dc) return;
+    void* data = nullptr;
+    auto bitmap = CreateDIBSection(dc,&info,DIB_RGB_COLORS,&data,nullptr,0);
+    if (!bitmap) { DeleteDC(dc); return; }
+    auto previous = SelectObject(dc,bitmap);
+    auto pixels = static_cast<std::uint32_t*>(data);
+    std::fill_n(pixels,size_t(width)*height,0);
+
     const auto view = waveView();
-    if (reveal && ready && analysis && view.span > 0 && viewWidth > 0 && waveformBottom > 4) {
-        auto border = CreateSolidBrush(RGB(36,170,158));
-        auto active = CreateSolidBrush(RGB(255,181,74));
+    if (reveal && ready && analysis && view.span > 0 && height > 4) {
+        constexpr int top = 2;
+        const int bottom = height-2;
+        // Premultiplied BGRA. Shade the gaps while leaving region interiors clear.
+        constexpr std::uint32_t shade = 0x68000000;
+        std::fill(pixels+size_t(top)*width,pixels+size_t(bottom)*width,shade);
         const auto& spans = analysis->intervals;
         auto first = std::lower_bound(spans.begin(),spans.end(),frameAtPixel(0,view),
             [](Interval span,double frame){ return span.end <= frame; });
-        for (auto i=first; i!=spans.end() && i->first < frameAtPixel(viewWidth,view); ++i) {
-            int left = pixelAtFrame(i->first,view,false);
-            int right = pixelAtFrame(i->end,view,true);
-            RECT box{left,2,right,waveformBottom-2};
-            FrameRect(dc,&box,i-spans.begin()==picked ? active : border);
+        const double viewEnd = frameAtPixel(width,view);
+        for (auto i=first; i!=spans.end() && i->first < viewEnd; ++i) {
+            const int left = pixelAtFrame(i->first,view,false);
+            const int right = pixelAtFrame(i->end,view,true);
+            const int from = std::max(0,left);
+            const int to = std::min(width,right);
+            if (from >= to) continue;
+            const std::uint32_t border = i-spans.begin()==picked ? 0xffffb54a : 0xff24aa9e;
+            for (int y=top; y<bottom; ++y) {
+                auto row = pixels+size_t(y)*width;
+                const bool edge = y==top || y==bottom-1;
+                std::fill(row+from,row+to,edge ? border : 0);
+                if (left >= 0) row[from] = border;
+                if (right <= width) row[to-1] = border;
+            }
         }
-        DeleteObject(active);
-        DeleteObject(border);
     }
-    EndPaint(w,&ps);
+    SIZE size{width,height};
+    POINT source{};
+    BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+    UpdateLayeredWindow(w,nullptr,nullptr,&size,dc,&source,0,&blend,ULW_ALPHA);
+    SelectObject(dc,previous);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
 }
 #else
 void paint(HWND w) {
@@ -475,8 +507,7 @@ HWND makeStrip(HWND parent) {
     HWND overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
         className,L"Audio region overlay",WS_CHILD,0,0,1,1,
         parent,reinterpret_cast<HMENU>(static_cast<INT_PTR>(viewId)),instance,nullptr);
-    if (overlay && SetLayeredWindowAttributes(overlay,transparent,0,LWA_COLORKEY) &&
-        SetWindowSubclass(parent,waveProcedure,viewId,0)) return overlay;
+    if (overlay && SetWindowSubclass(parent,waveProcedure,viewId,0)) return overlay;
     if (overlay) DestroyWindow(overlay);
     return nullptr;
 }

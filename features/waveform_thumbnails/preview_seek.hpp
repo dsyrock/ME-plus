@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -52,6 +53,9 @@ public:
     if(fader && IsWindow(fader) && IsWindow(root)) setPosition(position);
   }
   bool available() const {return fader!=nullptr;}
+  void stop() const {
+    if(IsWindow(root)) SendMessage(root,WM_COMMAND,1009,0);
+  }
   ScopedPreviewMute(const ScopedPreviewMute&) = delete;
   ScopedPreviewMute& operator=(const ScopedPreviewMute&) = delete;
 };
@@ -61,6 +65,10 @@ class PreviewSeek {
   double ratio=0;
   uint64_t requestedAt=0,releasedAt=0,openedAt=0;
   bool released=false,opened=false;
+#ifdef _WIN32
+  std::optional<ScopedPreviewMute> mute;
+  uint64_t gestureAt=0;
+#endif
 public:
   uint64_t requests=0,completed=0,cancelled=0;
   double lastRatio=0;
@@ -72,7 +80,24 @@ public:
     pendingPath=file;ratio=std::clamp(fraction,0.0,1.0);requestedAt=time;
     released=opened=false;error.clear();++requests;return true;
   }
-  void cancel(){if(pending()){++cancelled;pendingPath.clear();}}
+#ifdef _WIN32
+  bool muting() const {return mute.has_value();}
+  bool beginGesture(HWND root,uint64_t time) {
+    if(!mute)mute.emplace(root);
+    if(!mute->available()){mute.reset();return false;}
+    gestureAt=time;
+    return true;
+  }
+  void expireGesture(uint64_t time) {
+    if(mute&&!pending()&&time-gestureAt>=4000)cancel();
+  }
+#endif
+  void cancel(){
+    if(pending()){++cancelled;pendingPath.clear();}
+#ifdef _WIN32
+    if(mute){mute->stop();mute.reset();}
+#endif
+  }
   // Selected path is re-resolved by the backend: a queued click must not act
   // on an old row after sorting, filtering, changing directory or selection.
   bool tick(HWND root,const std::string& selectedPath,uint64_t time) {
@@ -80,12 +105,13 @@ public:
     if(!IsWindow(root)||selectedPath!=pendingPath){cancel();return true;}
     if(time-requestedAt>4000){error="Preview seek timed out";cancel();return true;}
     if(GetAsyncKeyState(VK_LBUTTON)&0x8000)return false;
+#ifndef _WIN32
     if(!released){released=true;releasedAt=time;return false;}
     if(time-releasedAt<60)return false;
+#endif
     if(!opened){
 #ifdef _WIN32
-      ScopedPreviewMute mute(root);
-      if(!mute.available()){error="Native preview volume control unavailable";cancel();return true;}
+      if(!beginGesture(root,time)){error="Native preview volume control unavailable";cancel();return true;}
 #endif
       SendMessage(root,WM_COMMAND,1009,0); // native Preview: Stop
       // Load from the current list selection, never OpenMediaExplorer(path):
@@ -110,6 +136,12 @@ public:
     int y=height/2;
     SendMessage(wave,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));
     SendMessage(wave,WM_LBUTTONUP,0,MAKELPARAM(x,y));
+#ifdef _WIN32
+    // Some native waveform gestures can start playback themselves. Stop that
+    // preview while it is still muted, then play from the saved seek position.
+    mute->stop();
+    mute.reset();
+#endif
     SendMessage(root,WM_COMMAND,40027,0); // native Play from last seek position
     lastPath=pendingPath;lastRatio=ratio;++completed;pendingPath.clear();return true;
   }

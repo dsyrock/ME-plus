@@ -539,27 +539,28 @@ LRESULT CALLBACK parentProc(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR
     if(hdr->code==LVN_BEGINDRAG)previewSeek.cancel();
     if(hdr->code==NM_CLICK||hdr->code==NM_DBLCLK){
       auto* click=reinterpret_cast<NMITEMACTIVATE*>(lp);
-      previewSeek.cancel();
       if(click->iSubItem==column&&column>=0){
         if(!mwt::previewModifiers()&&ownsColumn()){
           scanRows(); // refresh hidden full paths in database/search results
           RECT cell{};auto it=rowWaves.find(click->iItem);
           if(it!=rowWaves.end()&&it->second->state==1&&it->second->published&&ListView_GetSubItemRect(list,click->iItem,column,LVIR_BOUNDS,&cell)){
             auto path=rows.count(click->iItem)?rows.at(click->iItem):std::wstring{};
-            if(!path.empty()){
+            if(!path.empty()&&previewSeek.beginGesture(w,GetTickCount64())){
               double fraction=mwt::thumbnailRatio(click->ptAction.x,cell.left,cell.right);
               NMITEMACTIVATE native=*click;native.hdr.code=NM_CLICK;native.iSubItem=0;
               // Let REAPER commit its current preview selection using a valid
               // native column, without forwarding a double-click insertion.
-              mwt::ScopedPreviewMute mute(w);
               DefSubclassProc(w,m,wp,reinterpret_cast<LPARAM>(&native));
-              if(mute.available())SendMessage(w,WM_COMMAND,1009,0);
+              SendMessage(w,WM_COMMAND,1009,0);
               seekRow=click->iItem;previewSeek.request(utf8(path),fraction,GetTickCount64());statusDirty=true;
+              return 0;
             }
           }
         }
+        previewSeek.cancel();
         return 0; // double-clicking a waveform must not insert into the project
       }
+      previewSeek.cancel();
     }
     if(hdr->code==LVN_GETDISPINFOW) {
       auto n=reinterpret_cast<NMLVDISPINFOW*>(lp);
@@ -644,13 +645,16 @@ LRESULT CALLBACK listProc(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) 
       if(wave!=rowWaves.end() && wave->second->state==1 && wave->second->published) {
         // Selection can start playback before NM_CLICK reaches the parent.
         const HWND owner=explorer;
-        mwt::ScopedPreviewMute mute(owner);
-        const LRESULT result=DefSubclassProc(w,m,wp,lp);
-        if(mute.available() && IsWindow(owner)) SendMessage(owner,WM_COMMAND,1009,0);
-        return result;
+        if(previewSeek.beginGesture(owner,GetTickCount64())){
+          const LRESULT result=DefSubclassProc(w,m,wp,lp);
+          if(IsWindow(owner)) SendMessage(owner,WM_COMMAND,1009,0);
+          if(m==WM_LBUTTONUP&&!previewSeek.pending())previewSeek.cancel();
+          return result;
+        }
       }
     }
   }
+  if(press||m==WM_CANCELMODE||m==WM_KEYDOWN)previewSeek.cancel();
   return DefSubclassProc(w,m,wp,lp);
 }
 void detach() {
@@ -811,6 +815,7 @@ void timer() {
   busy=true;
   try {
     auto now=GetTickCount64();
+    previewSeek.expireGesture(now);
 #ifdef MWT_PROFILE
     const char* command=GetExtState(section,"profile_command");
     if(command&&std::string(command)=="drop_bitmaps") {
@@ -841,7 +846,7 @@ void timer() {
             auto path=(row!=rows.end()&&ListView_GetItemState(list,seekRow,LVIS_SELECTED))?utf8(row->second):std::string{};
             if(previewSeek.tick(explorer,path,now))statusDirty=true;
           }
-        }
+        } else if(previewSeek.muting())previewSeek.cancel();
       }
     }
     bool update=statusDirty;
@@ -849,7 +854,7 @@ void timer() {
     update=true;
 #endif
     if(update&&now-lastStatus>=300){lastStatus=now;publishStatus();}
-  }catch(const std::exception& e){lastError=e.what();statusDirty=true;stopBuild();}
+  }catch(const std::exception& e){previewSeek.cancel();lastError=e.what();statusDirty=true;stopBuild();}
   busy=false;
 }
 bool hookCommand(int cmd,int) {

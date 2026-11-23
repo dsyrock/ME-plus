@@ -551,7 +551,9 @@ LRESULT CALLBACK parentProc(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR
               NMITEMACTIVATE native=*click;native.hdr.code=NM_CLICK;native.iSubItem=0;
               // Let REAPER commit its current preview selection using a valid
               // native column, without forwarding a double-click insertion.
+              mwt::ScopedPreviewMute mute(w);
               DefSubclassProc(w,m,wp,reinterpret_cast<LPARAM>(&native));
+              if(mute.available())SendMessage(w,WM_COMMAND,1009,0);
               seekRow=click->iItem;previewSeek.request(utf8(path),fraction,GetTickCount64());statusDirty=true;
             }
           }
@@ -630,6 +632,25 @@ LRESULT CALLBACK listProc(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) 
     if(!dirtySince)dirtySince=GetTickCount64();
   }
   if(m==WM_NCDESTROY)RemoveWindowSubclass(w,listProc,subclassId);
+  const bool press=m==WM_LBUTTONDOWN||m==WM_LBUTTONUP||m==WM_LBUTTONDBLCLK;
+  if(press &&
+     !(wp&(MK_CONTROL|MK_SHIFT)) && !mwt::previewModifiers() && ownsColumn()) {
+    LVHITTESTINFO hit{};
+    hit.pt={short(LOWORD(lp)),short(HIWORD(lp))};
+    int row=ListView_SubItemHitTest(w,&hit);
+    RECT cell{};
+    if(row>=0 && ListView_GetSubItemRect(w,row,column,LVIR_BOUNDS,&cell) && PtInRect(&cell,hit.pt)) {
+      auto wave=rowWaves.find(row);
+      if(wave!=rowWaves.end() && wave->second->state==1 && wave->second->published) {
+        // Selection can start playback before NM_CLICK reaches the parent.
+        const HWND owner=explorer;
+        mwt::ScopedPreviewMute mute(owner);
+        const LRESULT result=DefSubclassProc(w,m,wp,lp);
+        if(mute.available() && IsWindow(owner)) SendMessage(owner,WM_COMMAND,1009,0);
+        return result;
+      }
+    }
+  }
   return DefSubclassProc(w,m,wp,lp);
 }
 void detach() {

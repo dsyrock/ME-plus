@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace mwt {
 inline std::string previewText(HWND w) {
@@ -26,6 +27,35 @@ inline double thumbnailRatio(double x,double left,double right) {
 inline bool previewModifiers() {
   return (GetAsyncKeyState(VK_CONTROL)|GetAsyncKeyState(VK_SHIFT)|GetAsyncKeyState(VK_MENU))&0x8000;
 }
+#ifdef _WIN32
+// REAPERhfader uses the trackbar position messages. The scroll notification
+// applies that position to native preview gain. Position zero is -inf dB.
+class ScopedPreviewMute {
+  HWND root, fader;
+  LRESULT position;
+  void setPosition(LRESULT value) const {
+    SendMessage(fader,WM_USER+5,TRUE,value); // TBM_SETPOS
+    SendMessage(root,WM_HSCROLL,SB_THUMBTRACK,reinterpret_cast<LPARAM>(fader));
+  }
+public:
+  explicit ScopedPreviewMute(HWND window)
+    : root(window), fader(GetDlgItem(window,1045)), position(0) {
+    wchar_t className[32]{};
+    if(!GetClassNameW(fader,className,32) || std::wstring_view(className)!=L"REAPERhfader") {
+      fader=nullptr;
+      return;
+    }
+    position=SendMessage(fader,WM_USER,0,0); // TBM_GETPOS
+    setPosition(0);
+  }
+  ~ScopedPreviewMute() {
+    if(fader && IsWindow(fader) && IsWindow(root)) setPosition(position);
+  }
+  bool available() const {return fader!=nullptr;}
+  ScopedPreviewMute(const ScopedPreviewMute&) = delete;
+  ScopedPreviewMute& operator=(const ScopedPreviewMute&) = delete;
+};
+#endif
 class PreviewSeek {
   std::string pendingPath;
   double ratio=0;
@@ -53,6 +83,10 @@ public:
     if(!released){released=true;releasedAt=time;return false;}
     if(time-releasedAt<60)return false;
     if(!opened){
+#ifdef _WIN32
+      ScopedPreviewMute mute(root);
+      if(!mute.available()){error="Native preview volume control unavailable";cancel();return true;}
+#endif
       SendMessage(root,WM_COMMAND,1009,0); // native Preview: Stop
       // Load from the current list selection, never OpenMediaExplorer(path):
       // that API can navigate out of a database/search to the source folder.
@@ -61,6 +95,7 @@ public:
       SendMessage(root,WM_COMMAND,1009,0);
       opened=true;openedAt=time;return true;
     }
+    // Allow the native preview pane to finish installing the new source.
     if(time-openedAt<100)return false;
     HWND wave=GetDlgItem(root,1046),label=GetDlgItem(root,1014);
     auto name=std::filesystem::u8path(pendingPath).filename().u8string();

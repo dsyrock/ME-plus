@@ -25,6 +25,8 @@ ME+ 是为 REAPER 媒体浏览器（Media Explorer）添加额外功能的扩展
 - **Windows** 上按住 Alt，在预览波形中显示区段框。区段间的空隙会压暗，区段内和标尺保留原有亮度。从框内开始拖动，再放到编排区的轨道上。
 - **macOS 和 Linux** 使用预览区底部的音频概览，从标出的区段拖到轨道上。
 
+Windows 上如果读不到当前缩放范围，区段框会按整段文件显示。若框和已放大的波形对不齐，可运行 `Preview: Zoom out full` 恢复全长视图。
+
 使用 `ME+: Show draggable audio regions` 开关功能，或用 `ME+: Configure audio region detection` 调整音量门限、静音时长与区段两端的留白。
 
 ## 构建

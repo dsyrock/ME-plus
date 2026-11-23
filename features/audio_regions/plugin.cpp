@@ -137,7 +137,8 @@ std::uintptr_t nativeViewportAddress;
 int waveformBottom;
 BOOL (WINAPI *getScrollInfo)(HWND,int,LPSCROLLINFO);
 struct WaveView {
-    double first = 0, span = 0;
+    // With no reliable viewport, map the full source to the available width.
+    double first = 0, span = 1;
     bool operator==(const WaveView& v) const {
         return first == v.first && span == v.span;
     }
@@ -191,7 +192,7 @@ void paint(HWND w) {
     std::fill_n(pixels,size_t(width)*height,0);
 
     const auto view = waveView();
-    if (reveal && ready && analysis && view.span > 0 && height > 4) {
+    if (reveal && ready && analysis && height > 4) {
         constexpr int top = 2;
         const int bottom = height-2;
         // Premultiplied BGRA. Shade the gaps while leaving region interiors clear.
@@ -282,7 +283,6 @@ int hit(int x) {
     if (!ready || !analysis || x < 0 || x >= viewWidth) return -1;
 #ifdef _WIN32
     const auto view = waveView();
-    if (view.span <= 0) return -1;
     double first = frameAtPixel(x,view);
     double end = frameAtPixel(x+1,view);
 #else

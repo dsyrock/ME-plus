@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <iomanip>
 #include <locale>
 #ifdef _WIN32
 #include <commctrl.h>
@@ -132,6 +133,7 @@ constexpr COLORREF dropColor = RGB(128,128,128);
 constexpr wchar_t className[] = L"ReaperAudioRegionStrip";
 HWND dropPreview;
 bool reveal;
+bool dragStarted;
 constexpr int previewScrollbars = 42169;
 std::uintptr_t nativeViewportAddress;
 int waveformBottom;
@@ -459,6 +461,26 @@ bool handle(HWND w, UINT msg, WPARAM, LPARAM lp) {
     }
 }
 #ifdef _WIN32
+std::wstring previewTime(double seconds) {
+    const auto minutes = static_cast<long long>(seconds/60);
+    std::wostringstream out;
+    out.imbue(std::locale::classic());
+    out << minutes << L':' << std::fixed << std::setprecision(9) << seconds-minutes*60.;
+    return out.str();
+}
+void selectPreviewRegion(int index) {
+    if (!ready || !analysis || !(selected(browser) == current)) return;
+    constexpr int startId = 1455, endId = 1456;
+    HWND start = GetDlgItem(browser,startId), end = GetDlgItem(browser,endId);
+    if (!start || !end) return;
+    const auto span = analysis->intervals[index];
+    const auto startText = previewTime(span.first/rate);
+    const auto endText = previewTime(span.end/rate);
+    if (SetWindowTextW(start,startText.c_str()) && SetWindowTextW(end,endText.c_str())) {
+        // REAPER debounces EN_CHANGE and then commits both native time fields.
+        SendMessage(browser,WM_COMMAND,MAKEWPARAM(endId,EN_CHANGE),reinterpret_cast<LPARAM>(end));
+    }
+}
 LRESULT CALLBACK procedure(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m==WM_PAINT) {
         if (w == dropPreview) {
@@ -488,14 +510,18 @@ LRESULT CALLBACK waveProcedure(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR id, 
     } else if (m==WM_LBUTTONDOWN && reveal && altHeld() && !(a & (MK_SHIFT|MK_CONTROL)) &&
                short(HIWORD(b)) >= 2 && short(HIWORD(b)) < waveformBottom-2 &&
                hit(short(LOWORD(b))) >= 0) {
+        dragStarted = false;
         handle(w,m,a,b);
         return 0;
     } else if (picked >= 0) {
-        if (m==WM_LBUTTONUP && !dragDistance({short(LOWORD(b)),short(HIWORD(b))})) {
-            POINT down=press;
+        const POINT point{short(LOWORD(b)),short(HIWORD(b))};
+        if (m==WM_MOUSEMOVE && dragDistance(point)) dragStarted = true;
+        if (m==WM_LBUTTONUP && !dragStarted && !dragDistance(point)) {
+            int index = picked;
             cancelDrag();
+            selectPreviewRegion(index);
             repaint();
-            DefSubclassProc(w,WM_LBUTTONDOWN,a|MK_LBUTTON,MAKELPARAM(down.x,down.y));
+            return 0;
         } else if (m==WM_LBUTTONUP || m==WM_MOUSEMOVE || m==WM_CAPTURECHANGED || m==WM_CANCELMODE) {
             handle(w,m,a,b);
             return 0;

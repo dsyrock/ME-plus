@@ -15,7 +15,4 @@ target_compile_definitions(native_library_cache PRIVATE NOMINMAX WIN32_LEAN_AND_
 target_compile_options(native_library_cache PRIVATE /W4 /utf-8)
 target_link_libraries(native_library_cache PRIVATE bcrypt)
 
-file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native_cache_prototype.enable"
-  CONTENT "Enable the REAPER 7.82 native Media Explorer cache prototype.\n")
 install(TARGETS native_library_cache LIBRARY DESTINATION UserPlugins RUNTIME DESTINATION UserPlugins)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/native_cache_prototype.enable" DESTINATION .)

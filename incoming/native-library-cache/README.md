@@ -4,15 +4,17 @@
 
 ## 构建与启用
 
-在 ME+ 的仓库根目录运行。
+在 ME+ 的仓库根目录运行。源码、构建文件和安装包都放在 `incoming/native-library-cache` 下。
 
 ```powershell
-cmake -S experiments/native_library_cache -B build/native-library-cache -G "Visual Studio 17 2022" -A x64
-cmake --build build/native-library-cache --config Release
-cmake --install build/native-library-cache --config Release --prefix build/native-library-cache/package
+cmake -S incoming/native-library-cache -B incoming/native-library-cache/build/current -G "Visual Studio 17 2022" -A x64
+cmake --build incoming/native-library-cache/build/current --config Release
+cmake --install incoming/native-library-cache/build/current --config Release --prefix incoming/native-library-cache/build/package
 ```
 
-将生成的包解压到独立测试实例的 REAPER 资源目录。DLL 放在 `UserPlugins`，`native_cache_prototype.enable` 放在资源目录根部。启动前把库副本放在 `MediaDB` 并配置原生快捷项。退出后移除启用文件即可停用。原型按宿主版本、原厂 DLL 的 SHA-256 和安装前的调用指令做匹配。
+把生成的 DLL 放在独立测试实例的 `UserPlugins` 并重启。启动前把库副本放在 `MediaDB` 并配置原生快捷项。原型按宿主版本、原厂 DLL 的 SHA-256 和安装前的调用指令做匹配。
+
+插件首次加载后默认启用。在 Main 或 Media Explorer 动作列表中运行 `ME+: Toggle native library cache` 可以切换。两个动作共用一个开关，状态会保留到下次启动。关闭时释放已经停放的缓存，当前列表继续使用 REAPER 自己持有的记录。再次打开后，下一次加载总库会重新建立缓存。
 
 ## 缓存行为
 

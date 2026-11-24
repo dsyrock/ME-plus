@@ -23,6 +23,10 @@
 namespace {
 
 constexpr char section[] = "MEPlusNativeCachePrototype";
+constexpr int explorerSection = 32063;
+constexpr char actionLabel[] = "ME+: Toggle native library cache";
+constexpr char mainActionName[] = "ME_NATIVE_LIBRARY_CACHE_TOGGLE";
+constexpr char explorerActionName[] = "ME_NATIVE_LIBRARY_CACHE_EXPLORER_TOGGLE";
 constexpr wchar_t moduleName[] = L"reaper_explorer.dll";
 constexpr char originalDigest[] = "be5957206e14683ffe6557e8169d4dd92d04b5ec6eee8f758541948e8069f355";
 constexpr std::size_t refreshRva = 0x509b0;
@@ -38,6 +42,7 @@ using Parse = bool(*)(const char*, void*, void*);
 using Compare = int(*)(const void*, const void*);
 using Sort = void(*)(void*, std::size_t, std::size_t, Compare);
 using SetState = void(*)(const char*, const char*, const char*, bool);
+using RefreshToolbar = void(*)(int, int);
 
 // In this build these are WDL buffers. The visible rows borrow the records
 // owned by the first buffer; the second owns the MediaDB scan root strings.
@@ -120,6 +125,13 @@ std::size_t installed = 0;
 reaper_plugin_info_t host{};
 std::wstring databasePath;
 SetState setState = nullptr;
+RefreshToolbar refreshToolbar = nullptr;
+gaccel_register_t mainAction{};
+custom_action_register_t explorerAction{explorerSection, explorerActionName, actionLabel, nullptr};
+int explorerCommandId = 0;
+bool mainActionRegistered = false;
+bool enabled = true;
+const char* installStatus = "waiting";
 Cache cache;
 Load* currentLoad = nullptr;
 unsigned parses = 0, hits = 0, sortHits = 0, parks = 0, invalidations = 0;
@@ -207,14 +219,25 @@ SortSettings readSortSettings()
         *native<const unsigned*>(0x10f8d4), *native<const unsigned*>(0x10b124)};
 }
 
-void publishState(const char* status)
+void disableCache()
+{
+    cache.active = false;
+    cache.liveRecords = {};
+    cache.liveRoots = {};
+    discardParked();
+    std::vector<void*>{}.swap(cache.originalOrder);
+    std::vector<void*>{}.swap(cache.sortedOrder);
+}
+
+void publishState()
 {
     if (!setState) return;
     char message[320];
     std::snprintf(message, sizeof(message),
-        "{\"status\":\"%s\",\"parses\":%u,\"hits\":%u,\"sort_hits\":%u,\"parks\":%u,"
+        "{\"status\":\"%s\",\"enabled\":%s,\"parses\":%u,\"hits\":%u,\"sort_hits\":%u,\"parks\":%u,"
         "\"invalidations\":%u,\"parked\":%s,\"refreshes\":%u,\"parser_calls\":%u}",
-        status, parses, hits, sortHits, parks, invalidations, cache.parked ? "true" : "false",
+        enabled ? installStatus : "disabled", enabled ? "true" : "false",
+        parses, hits, sortHits, parks, invalidations, cache.parked ? "true" : "false",
         refreshes, parserCalls);
     setState(section, "status", message, false);
 }
@@ -246,7 +269,7 @@ void park(View view)
 void refreshHook(void* model, unsigned flags, const void* selection, const void* scroll)
 {
     const auto refresh = native<Refresh>(refreshRva);
-    if (GetCurrentThreadId() != uiThread || model != explorer + modelRva) {
+    if (!enabled || GetCurrentThreadId() != uiThread || model != explorer + modelRva) {
         refresh(model, flags, selection, scroll);
         return;
     }
@@ -269,6 +292,11 @@ void refreshHook(void* model, unsigned flags, const void* selection, const void*
     refresh(model, flags, selection, scroll);
     currentLoad = nullptr;
 
+    if (!enabled) {
+        disableCache();
+        publishState();
+        return;
+    }
     if (load.parsed && !load.reentered && validBuffer(view.records()) && validBuffer(view.roots())) {
         cache.stamp = load.stamp;
         cache.liveRecords = view.records();
@@ -283,13 +311,13 @@ void refreshHook(void* model, unsigned flags, const void* selection, const void*
         discardParked();
         clearSort();
     }
-    publishState("installed");
+    publishState();
 }
 
 bool parseHook(const char* path, void* records, void* roots)
 {
     const auto parse = native<Parse>(parseRva);
-    if (GetCurrentThreadId() != uiThread || !currentLoad
+    if (!enabled || GetCurrentThreadId() != uiThread || !currentLoad
         || records != &currentLoad->view.records() || roots != &currentLoad->view.roots()) {
         return parse(path, records, roots);
     }
@@ -331,7 +359,7 @@ bool parseHook(const char* path, void* records, void* roots)
 void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare)
 {
     const auto sort = native<Sort>(sortRva);
-    if (GetCurrentThreadId() != uiThread || !currentLoad || !currentLoad->parsed || !data
+    if (!enabled || GetCurrentThreadId() != uiThread || !currentLoad || !currentLoad->parsed || !data
         || stride != sizeof(void*) || count == 0 || count > 2000000
         || compare != native<Compare>(compareRva)) {
         sort(data, count, stride, compare);
@@ -501,7 +529,8 @@ void timer()
     host.Register("-timer", reinterpret_cast<void*>(timer));
     try {
         if (!expectedImage(module)) {
-            publishState("unsupported-image");
+            installStatus = "unsupported-image";
+            publishState();
             return;
         }
         explorer = reinterpret_cast<std::byte*>(module);
@@ -511,10 +540,80 @@ void timer()
         HMODULE pinned{};
         const bool resident = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
             | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(timer), &pinned);
-        publishState(resident && installPatches() ? "installed" : "install-failed");
+        installStatus = resident && installPatches() ? "installed" : "install-failed";
     } catch (const std::bad_alloc&) {
-        publishState("install-failed");
+        installStatus = "install-failed";
     }
+    publishState();
+}
+
+void toggleCache()
+{
+    enabled = !enabled;
+    setState(section, "enabled", enabled ? "1" : "0", true);
+    if (!enabled) {
+        // A modal message inside a refresh can dispatch the action before
+        // the native caller has finished publishing its borrowed pointers.
+        if (currentLoad) currentLoad->reentered = true;
+        else disableCache();
+    }
+    publishState();
+    if (refreshToolbar) {
+        refreshToolbar(0, mainAction.accel.cmd);
+        refreshToolbar(explorerSection, explorerCommandId);
+    }
+}
+
+bool mainCommand(int command, int)
+{
+    if (!mainActionRegistered || command != mainAction.accel.cmd) return false;
+    toggleCache();
+    return true;
+}
+
+bool explorerCommand(KbdSectionInfo* context, int command, int, int, int, HWND)
+{
+    if (!context || context->uniqueID != explorerSection || !explorerCommandId
+        || command != explorerCommandId) return false;
+    toggleCache();
+    return true;
+}
+
+int toggleState(int command)
+{
+    if (command > 0 && (command == explorerCommandId || command == mainAction.accel.cmd)) {
+        return int(enabled);
+    }
+    return -1;
+}
+
+void unregisterActions()
+{
+    host.Register("-toggleaction", reinterpret_cast<void*>(toggleState));
+    host.Register("-hookcommand2", reinterpret_cast<void*>(explorerCommand));
+    host.Register("-hookcommand", reinterpret_cast<void*>(mainCommand));
+    if (explorerCommandId) host.Register("-custom_action", &explorerAction);
+    if (mainActionRegistered) host.Register("-gaccel", &mainAction);
+    explorerCommandId = 0;
+    mainActionRegistered = false;
+}
+
+bool registerActions()
+{
+    const int commandId = host.Register("command_id", const_cast<char*>(mainActionName));
+    if (commandId <= 0 || commandId > std::numeric_limits<WORD>::max()) return false;
+    mainAction.accel.cmd = WORD(commandId);
+    mainAction.desc = actionLabel;
+    mainActionRegistered = host.Register("gaccel", &mainAction) != 0;
+    if (!mainActionRegistered) return false;
+    explorerCommandId = host.Register("custom_action", &explorerAction);
+    if (explorerCommandId <= 0) {
+        explorerCommandId = 0;
+        return false;
+    }
+    return host.Register("hookcommand", reinterpret_cast<void*>(mainCommand))
+        && host.Register("hookcommand2", reinterpret_cast<void*>(explorerCommand))
+        && host.Register("toggleaction", reinterpret_cast<void*>(toggleState));
 }
 
 } // namespace
@@ -523,7 +622,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
     REAPER_PLUGIN_HINSTANCE, reaper_plugin_info_t* info)
 {
     if (!info) {
-        if (host.Register) host.Register("-timer", reinterpret_cast<void*>(timer));
+        if (host.Register) {
+            host.Register("-timer", reinterpret_cast<void*>(timer));
+            unregisterActions();
+        }
         removePatches();
         if (installed == 0 && cache.parked && GetModuleHandleW(moduleName) == reinterpret_cast<HMODULE>(explorer)) {
             discardParked();
@@ -535,15 +637,23 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
     try {
         const auto getResource = reinterpret_cast<const char*(*)()>(info->GetFunc("GetResourcePath"));
         const auto getVersion = reinterpret_cast<const char*(*)()>(info->GetFunc("GetAppVersion"));
+        const auto getState = reinterpret_cast<const char*(*)(const char*, const char*)>(info->GetFunc("GetExtState"));
         setState = reinterpret_cast<SetState>(info->GetFunc("SetExtState"));
-        if (!getResource || !getVersion || std::strcmp(getVersion(), "7.82/x64") != 0) return 0;
+        refreshToolbar = reinterpret_cast<RefreshToolbar>(info->GetFunc("RefreshToolbar2"));
+        if (!getResource || !getVersion || !getState || !setState
+            || std::strcmp(getVersion(), "7.82/x64") != 0) return 0;
         const auto resource = utf8ToWide(getResource());
         if (resource.empty()) return 0;
-        if (GetFileAttributesW((resource + L"\\native_cache_prototype.enable").c_str()) == INVALID_FILE_ATTRIBUTES) return 0;
         databasePath = resource + L"\\MediaDB\\06.ReaperFileList";
         host = *info;
-        publishState("waiting");
-        return host.Register("timer", reinterpret_cast<void*>(timer)) ? 1 : 0;
+        enabled = std::strcmp(getState(section, "enabled"), "0") != 0;
+        if (!registerActions() || !host.Register("timer", reinterpret_cast<void*>(timer))) {
+            unregisterActions();
+            host = {};
+            return 0;
+        }
+        publishState();
+        return 1;
     } catch (const std::bad_alloc&) {
         return 0;
     }

@@ -1,8 +1,10 @@
 #include "reaper_plugin.h"
+#include "disk_cache.h"
 
 #include <bcrypt.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -44,45 +46,17 @@ using Sort = void(*)(void*, std::size_t, std::size_t, Compare);
 using SetState = void(*)(const char*, const char*, const char*, bool);
 using RefreshToolbar = void(*)(int, int);
 
-// Read-only view of this build's WDL buffers. REAPER owns all record pointers.
-struct Buffer {
-    void** data;
-    int capacityBytes;
-    int usedBytes;
-};
-
-static_assert(offsetof(Buffer, usedBytes) == 12);
+using media_cache::Buffer;
+using media_cache::FileStamp;
+using media_cache::SortSettings;
+using Clock = std::chrono::steady_clock;
 
 struct View {
     std::byte* state;
 
     const Buffer& visible() const { return *reinterpret_cast<const Buffer*>(state + 0x18); }
     const Buffer& records() const { return *reinterpret_cast<const Buffer*>(state + 0x30); }
-    const void* roots() const { return state + 0x48; }
-};
-
-struct FileStamp {
-    DWORD volume, fileHigh, fileLow, sizeHigh, sizeLow;
-    FILETIME writeTime;
-
-    bool operator==(const FileStamp& other) const
-    {
-        return volume == other.volume && fileHigh == other.fileHigh && fileLow == other.fileLow
-            && sizeHigh == other.sizeHigh && sizeLow == other.sizeLow
-            && CompareFileTime(&writeTime, &other.writeTime) == 0;
-    }
-};
-
-struct SortSettings {
-    int column;
-    bool reverse;
-    unsigned listFlags, explorerFlags;
-
-    bool operator==(const SortSettings& other) const
-    {
-        return column == other.column && reverse == other.reverse
-            && listFlags == other.listFlags && explorerFlags == other.explorerFlags;
-    }
+    const Buffer& roots() const { return *reinterpret_cast<const Buffer*>(state + 0x48); }
 };
 
 struct OrderCache {
@@ -110,6 +84,7 @@ void* relayPage = nullptr;
 std::size_t installed = 0;
 reaper_plugin_info_t host{};
 std::wstring databasePath;
+std::filesystem::path snapshotPath, orderPath;
 SetState setState = nullptr;
 RefreshToolbar refreshToolbar = nullptr;
 gaccel_register_t mainAction{};
@@ -122,6 +97,9 @@ OrderCache cache;
 Load* currentLoad = nullptr;
 unsigned parses = 0, sortHits = 0, invalidations = 0;
 unsigned refreshes = 0, parserCalls = 0;
+unsigned snapshotHits = 0, snapshotWrites = 0, diskSortHits = 0;
+double lastLoadMs = 0.0, lastWriteMs = 0.0;
+media_cache::ReadMetrics lastRead;
 
 template<class Fn>
 Fn native(std::size_t offset)
@@ -152,6 +130,17 @@ bool readStamp(FileStamp& stamp)
     return ok;
 }
 
+bool unchanged(const FileStamp& stamp)
+{
+    FileStamp now{};
+    return readStamp(now) && now == stamp;
+}
+
+double durationMs(Clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
 SortSettings readSortSettings()
 {
     return {*native<const int*>(0x10f8a4), *native<const char*>(0x10f8a8) != 0,
@@ -167,13 +156,17 @@ void clearOrder()
 void publishState()
 {
     if (!setState) return;
-    char message[320];
+    char message[512];
     std::snprintf(message, sizeof(message),
         "{\"status\":\"%s\",\"enabled\":%s,\"parses\":%u,\"sort_hits\":%u,"
-        "\"order_bytes\":%zu,\"invalidations\":%u,\"refreshes\":%u,\"parser_calls\":%u}",
+        "\"order_bytes\":%zu,\"invalidations\":%u,\"refreshes\":%u,\"parser_calls\":%u,"
+        "\"snapshot_hits\":%u,\"snapshot_writes\":%u,\"disk_sort_hits\":%u,"
+        "\"load_ms\":%.3f,\"write_ms\":%.3f,\"read_ms\":%.3f,\"decompress_ms\":%.3f,\"verify_ms\":%.3f}",
         enabled ? installStatus : "disabled", enabled ? "true" : "false",
         parses, sortHits, cache.ordinals.capacity() * sizeof(std::uint32_t),
-        invalidations, refreshes, parserCalls);
+        invalidations, refreshes, parserCalls,
+        snapshotHits, snapshotWrites, diskSortHits, lastLoadMs, lastWriteMs,
+        lastRead.readMs, lastRead.decompressMs, lastRead.verifyMs);
     setState(section, "status", message, false);
 }
 
@@ -203,7 +196,7 @@ bool parseHook(const char* path, void* records, void* roots)
 {
     const auto parse = native<Parse>(parseRva);
     if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || currentLoad->reentered
-        || records != &currentLoad->view.records() || roots != currentLoad->view.roots()) {
+        || records != &currentLoad->view.records() || roots != &currentLoad->view.roots()) {
         return parse(path, records, roots);
     }
 
@@ -217,12 +210,45 @@ bool parseHook(const char* path, void* records, void* roots)
     auto& load = *currentLoad;
     FileStamp stamp{};
     const bool haveStamp = readStamp(stamp);
+    auto& nativeRecords = *static_cast<Buffer*>(records);
+    auto& nativeRoots = *static_cast<Buffer*>(roots);
+    load.stamp = stamp;
+    if (!cache.ordinals.empty() && (!haveStamp || !(cache.stamp == stamp))) clearOrder();
+    const auto start = Clock::now();
+    lastWriteMs = 0.0;
+    lastRead = {};
+    if (haveStamp) {
+        const media_cache::NativeApi api{
+            native<void*(*)(std::size_t)>(0xb8de0),
+            native<void(*)(void*)>(0xb8280),
+            native<void(*)(void*)>(0x17590),
+            native<void(*)(void*, const char*, const char*, char)>(0x10fb8)
+        };
+        try {
+            if (media_cache::readSnapshot(snapshotPath, stamp, api, nativeRecords, nativeRoots, unchanged, lastRead)) {
+                load.parsed = true;
+                ++snapshotHits;
+                lastLoadMs = durationMs(start);
+                return true;
+            }
+        } catch (const std::bad_alloc&) {
+            // Temporary native records are released by the snapshot reader.
+        }
+    }
+
     ++parses;
     const bool result = parse(path, records, roots);
-    FileStamp after{};
-    load.parsed = result && haveStamp && readStamp(after) && after == stamp;
-    load.stamp = stamp;
-    if (!cache.ordinals.empty() && (!load.parsed || !(cache.stamp == stamp))) clearOrder();
+    lastLoadMs = durationMs(start);
+    load.parsed = result && haveStamp && unchanged(stamp);
+    if (load.parsed && enabled && !load.reentered) {
+        const auto writing = Clock::now();
+        try {
+            if (media_cache::writeSnapshot(snapshotPath, stamp, nativeRecords, nativeRoots)) ++snapshotWrites;
+        } catch (const std::bad_alloc&) {
+            // The native result already belongs to REAPER.
+        }
+        lastWriteMs = durationMs(writing);
+    }
     return result;
 }
 
@@ -253,6 +279,7 @@ void rememberOrder(const View& view, std::size_t count, const FileStamp& stamp, 
             next.ordinals.push_back(source->second);
         }
         cache = std::move(next);
+        media_cache::writeOrder(orderPath, stamp, settings, cache.ordinals);
     } catch (const std::bad_alloc&) {
         // Native sorting is already complete.
     }
@@ -270,16 +297,27 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
     }
 
     const auto settings = readSortSettings();
-    // The name comparator has a small, verified set of inputs. Use REAPER's
-    // comparator for rating/favourite sorts, random sorts and custom columns.
+    // The file name and the user's current metadata column have been checked.
+    // Rating/favourite priority, random sorts and custom columns use REAPER.
     const auto view = currentLoad->view;
-    if (settings.column != 0 || (settings.listFlags & 0x20)
+    if ((settings.column != 0 && settings.column != 13) || (settings.listFlags & 0x20)
         || !fullFileOrder(view, data, count * stride)) {
         sort(data, count, stride, compare);
         return;
     }
 
     const auto stamp = currentLoad->stamp;
+    if (!(cache.stamp == stamp && cache.sortSettings == settings && cache.ordinals.size() == count)) {
+        try {
+            OrderCache saved{stamp, settings, {}};
+            if (media_cache::readOrder(orderPath, stamp, settings, count, saved.ordinals)) {
+                cache = std::move(saved);
+                ++diskSortHits;
+            }
+        } catch (const std::bad_alloc&) {
+            // Native sorting remains available.
+        }
+    }
     if (cache.stamp == stamp && cache.sortSettings == settings && cache.ordinals.size() == count) {
         auto** rows = static_cast<void**>(data);
         auto* const* records = view.records().data;
@@ -533,6 +571,9 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         const auto resource = utf8ToWide(getResource());
         if (resource.empty()) return 0;
         databasePath = resource + L"\\MediaDB\\06.ReaperFileList";
+        const auto cacheDirectory = std::filesystem::path(resource) / L"MEPlusNativeCache";
+        snapshotPath = cacheDirectory / L"06.snapshot";
+        orderPath = cacheDirectory / L"06.order";
         host = *info;
         enabled = std::strcmp(getState(section, "enabled"), "0") != 0;
         if (!registerActions() || !host.Register("timer", reinterpret_cast<void*>(timer))) {

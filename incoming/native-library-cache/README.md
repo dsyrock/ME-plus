@@ -1,6 +1,6 @@
 # Media Explorer 总库回切缓存原型
 
-扩展在 Windows x64 的 REAPER 7.82 进程内缓存「总库」的名称排序顺序。树快捷项、解析、搜索、列表发布和媒体操作由原生 Media Explorer 提供。缓存范围是资源目录下的 `MediaDB/06.ReaperFileList`。
+扩展在 Windows x64 的 REAPER 7.82 进程内为「总库」生成磁盘快照和排序索引。树快捷项、搜索、列表发布和媒体操作由原生 Media Explorer 提供。缓存范围是资源目录下的 `MediaDB/06.ReaperFileList`。
 
 ## 构建与启用
 
@@ -14,12 +14,14 @@ cmake --install incoming/native-library-cache/build/current --config Release --p
 
 把生成的 DLL 放在独立测试实例的 `UserPlugins` 并重启。启动前把库副本放在 `MediaDB` 并配置原生快捷项。原型按宿主版本、原厂 DLL 的 SHA-256 和安装前的调用指令做匹配。
 
-插件首次加载后默认启用。在 Main 或 Media Explorer 动作列表中运行 `ME+: Toggle native library cache` 可以切换。两个动作共用一个开关，状态会保留到下次启动。关闭时释放排序索引，再启用后会在下一次符合条件的加载时重新建立。
+插件首次加载后默认启用。在 Main 或 Media Explorer 动作列表中运行 `ME+: Toggle native library cache` 可以切换。两个动作共用一个开关，状态会保留到下次启动。关闭时停止使用磁盘缓存，并释放内存中的排序索引。重新启用后可以继续使用有效的磁盘文件。
 
 ## 缓存行为
 
-REAPER 每次打开总库都会解析数据库并建立本次的原生记录。首次按名称排列全库时，扩展把排序结果保存为文件序号。回切时只有数据库的文件身份、大小、修改时间、排序设置和完整输入顺序都匹配，才会按缓存序号排列新记录。筛选结果和其他排序继续走原生逻辑。
+首次打开由 REAPER 解析原库。扩展将已解析的路径、属性、标签、自定义字段和扫描根目录分块写入资源目录下的 `MEPlusNativeCache/06.snapshot`。之后命中快照时，扩展用原生分配器重建记录，再交回给原生列表。数据块使用 Windows XPRESS 压缩和 SHA-256 校验。文件身份、大小或修改时间变化，以及快照损坏时，扩展回到原生加载并重建缓存。
 
-切离总库后，文件记录和元数据由 REAPER 正常释放。每条记录在缓存中用一个 32 位序号表示，1,356,223 条记录约占 5.2 MiB。索引保存在进程内存中，退出 REAPER 后会重新建立。总库打开期间的内存占用仍由原生记录决定。
+符合条件的全库排序保存在同一目录的 `06.order`。当前支持文件名和本机已验证的第 13 号排序列。应用索引前，扩展会核对数据库身份、排序设置和完整输入顺序。筛选结果和其他排序继续走原生逻辑。
 
-ReaScript 可通过 `GetExtState("MEPlusNativeCachePrototype", "status")` 读取加载状态、索引内存字节数和排序命中次数。
+切离总库后，文件记录和元数据由 REAPER 正常释放。两个磁盘文件可跨 REAPER 重启复用。测试的 1,356,223 条记录占用约 47.2 MiB 磁盘空间，运行期间保留的排序索引约 5.2 MiB。
+
+ReaScript 可通过 `GetExtState("MEPlusNativeCachePrototype", "status")` 读取快照与排序命中次数，以及读取、解压和校验耗时。

@@ -13,7 +13,8 @@
 #include <limits>
 #include <new>
 #include <string>
-#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifndef _M_X64
@@ -36,7 +37,6 @@ constexpr std::size_t compareRva = 0x16620;
 constexpr std::size_t modelRva = 0x10e0a0;
 
 using Address = std::uintptr_t;
-using NativeDeleter = void(*)(void*);
 using Refresh = void(*)(void*, unsigned, const void*, const void*);
 using Parse = bool(*)(const char*, void*, void*);
 using Compare = int(*)(const void*, const void*);
@@ -44,30 +44,21 @@ using Sort = void(*)(void*, std::size_t, std::size_t, Compare);
 using SetState = void(*)(const char*, const char*, const char*, bool);
 using RefreshToolbar = void(*)(int, int);
 
-// In this build these are WDL buffers. The visible rows borrow the records
-// owned by the first buffer; the second owns the MediaDB scan root strings.
+// Read-only view of this build's WDL buffers. REAPER owns all record pointers.
 struct Buffer {
     void** data;
     int capacityBytes;
     int usedBytes;
-    int granularity;
 };
 
-static_assert(sizeof(Buffer) == 24 && offsetof(Buffer, usedBytes) == 12);
+static_assert(offsetof(Buffer, usedBytes) == 12);
 
 struct View {
     std::byte* state;
 
-    Buffer& visible() const { return *reinterpret_cast<Buffer*>(state + 0x18); }
-    Buffer& records() const { return *reinterpret_cast<Buffer*>(state + 0x30); }
-    Buffer& roots() const { return *reinterpret_cast<Buffer*>(state + 0x48); }
-
-    std::string_view pathAt(std::size_t offset) const
-    {
-        const auto& string = *reinterpret_cast<const Buffer*>(state + offset);
-        if (!string.data || string.usedBytes <= 0 || string.usedBytes > 32768) return {};
-        return {reinterpret_cast<const char*>(string.data), std::size_t(string.usedBytes - 1)};
-    }
+    const Buffer& visible() const { return *reinterpret_cast<const Buffer*>(state + 0x18); }
+    const Buffer& records() const { return *reinterpret_cast<const Buffer*>(state + 0x30); }
+    const void* roots() const { return state + 0x48; }
 };
 
 struct FileStamp {
@@ -94,20 +85,15 @@ struct SortSettings {
     }
 };
 
-struct Cache {
-    Buffer records{}, roots{};
+struct OrderCache {
     FileStamp stamp{};
-    std::vector<void*> originalOrder, sortedOrder;
     SortSettings sortSettings{};
-    bool parked = false;
-    bool active = false;
-    Buffer liveRecords{}, liveRoots{};
+    std::vector<std::uint32_t> ordinals;
 };
 
 struct Load {
     View view;
     bool parsed = false;
-    bool hit = false;
     bool reentered = false;
     FileStamp stamp{};
 };
@@ -132,9 +118,9 @@ int explorerCommandId = 0;
 bool mainActionRegistered = false;
 bool enabled = true;
 const char* installStatus = "waiting";
-Cache cache;
+OrderCache cache;
 Load* currentLoad = nullptr;
-unsigned parses = 0, hits = 0, sortHits = 0, parks = 0, invalidations = 0;
+unsigned parses = 0, sortHits = 0, invalidations = 0;
 unsigned refreshes = 0, parserCalls = 0;
 
 template<class Fn>
@@ -166,67 +152,16 @@ bool readStamp(FileStamp& stamp)
     return ok;
 }
 
-bool sameAllocation(const Buffer& left, const Buffer& right)
-{
-    return left.data == right.data && left.usedBytes == right.usedBytes;
-}
-
-void freeNativeBuffer(Buffer& buffer)
-{
-    if (buffer.data) native<NativeDeleter>(0xb8280)(buffer.data);
-    const auto granularity = buffer.granularity;
-    buffer = {};
-    buffer.granularity = granularity;
-}
-
-void clearSort()
-{
-    cache.originalOrder.clear();
-    cache.sortedOrder.clear();
-}
-
-void discardParked()
-{
-    if (!cache.parked) return;
-    using ClearRoots = void(*)(void*, char, NativeDeleter);
-    using ClearRecords = void(*)(void*, NativeDeleter);
-    native<ClearRoots>(0x69774)(&cache.roots, 1, native<NativeDeleter>(0xb8280));
-    native<ClearRecords>(0x115e4)(&cache.records, native<NativeDeleter>(0x17590));
-    freeNativeBuffer(cache.roots);
-    freeNativeBuffer(cache.records);
-    cache.parked = false;
-    clearSort();
-    ++invalidations;
-}
-
-void moveBuffer(Buffer& destination, Buffer& source)
-{
-    destination = source;
-    const int granularity = source.granularity;
-    source = {};
-    source.granularity = granularity;
-}
-
-bool validBuffer(const Buffer& buffer)
-{
-    return buffer.capacityBytes >= buffer.usedBytes && buffer.usedBytes >= 0
-        && buffer.usedBytes % sizeof(void*) == 0 && (buffer.data || buffer.usedBytes == 0);
-}
-
 SortSettings readSortSettings()
 {
     return {*native<const int*>(0x10f8a4), *native<const char*>(0x10f8a8) != 0,
         *native<const unsigned*>(0x10f8d4), *native<const unsigned*>(0x10b124)};
 }
 
-void disableCache()
+void clearOrder()
 {
-    cache.active = false;
-    cache.liveRecords = {};
-    cache.liveRoots = {};
-    discardParked();
-    std::vector<void*>{}.swap(cache.originalOrder);
-    std::vector<void*>{}.swap(cache.sortedOrder);
+    if (!cache.ordinals.empty()) ++invalidations;
+    cache = {};
 }
 
 void publishState()
@@ -234,42 +169,18 @@ void publishState()
     if (!setState) return;
     char message[320];
     std::snprintf(message, sizeof(message),
-        "{\"status\":\"%s\",\"enabled\":%s,\"parses\":%u,\"hits\":%u,\"sort_hits\":%u,\"parks\":%u,"
-        "\"invalidations\":%u,\"parked\":%s,\"refreshes\":%u,\"parser_calls\":%u}",
+        "{\"status\":\"%s\",\"enabled\":%s,\"parses\":%u,\"sort_hits\":%u,"
+        "\"order_bytes\":%zu,\"invalidations\":%u,\"refreshes\":%u,\"parser_calls\":%u}",
         enabled ? installStatus : "disabled", enabled ? "true" : "false",
-        parses, hits, sortHits, parks, invalidations, cache.parked ? "true" : "false",
-        refreshes, parserCalls);
+        parses, sortHits, cache.ordinals.capacity() * sizeof(std::uint32_t),
+        invalidations, refreshes, parserCalls);
     setState(section, "status", message, false);
-}
-
-void park(View view)
-{
-    FileStamp stamp{};
-    if (cache.parked || !readStamp(stamp) || !(cache.stamp == stamp)
-        || !sameAllocation(view.records(), cache.liveRecords)
-        || !sameAllocation(view.roots(), cache.liveRoots)
-        || !validBuffer(view.records()) || !validBuffer(view.roots())
-        || view.records().usedBytes == 0) {
-        clearSort();
-        return;
-    }
-    if (!cache.sortedOrder.empty()
-        && (std::size_t(view.visible().usedBytes) != cache.sortedOrder.size() * sizeof(void*)
-            || !view.visible().data
-            || std::memcmp(view.visible().data, cache.sortedOrder.data(), view.visible().usedBytes) != 0)) {
-        clearSort();
-    }
-    // The caller clears its borrowed visible pointers before rebuilding.
-    moveBuffer(cache.records, view.records());
-    moveBuffer(cache.roots, view.roots());
-    cache.parked = true;
-    ++parks;
 }
 
 void refreshHook(void* model, unsigned flags, const void* selection, const void* scroll)
 {
     const auto refresh = native<Refresh>(refreshRva);
-    if (!enabled || GetCurrentThreadId() != uiThread || model != explorer + modelRva) {
+    if (GetCurrentThreadId() != uiThread || !enabled || model != explorer + modelRva) {
         refresh(model, flags, selection, scroll);
         return;
     }
@@ -279,46 +190,20 @@ void refreshHook(void* model, unsigned flags, const void* selection, const void*
         return;
     }
 
-    const View view{static_cast<std::byte*>(model)};
     ++refreshes;
-    const bool changedPath = view.pathAt(0x68) != view.pathAt(0x80);
-    const bool previouslyTarget = cache.active;
-    const bool leaving = previouslyTarget && changedPath;
-    // Navigation requests a full refresh. A partial refresh is left alone.
-    if (leaving && (flags & 0xff) == 1) park(view);
-    cache.active = false;
-    Load load{view};
+    Load load{{static_cast<std::byte*>(model)}};
     currentLoad = &load;
     refresh(model, flags, selection, scroll);
     currentLoad = nullptr;
 
-    if (!enabled) {
-        disableCache();
-        publishState();
-        return;
-    }
-    if (load.parsed && !load.reentered && validBuffer(view.records()) && validBuffer(view.roots())) {
-        cache.stamp = load.stamp;
-        cache.liveRecords = view.records();
-        cache.liveRoots = view.roots();
-        cache.active = true;
-    } else if (previouslyTarget && !leaving) {
-        // Filtering uses the raw records already installed in the view.
-        // Keep those records eligible, but let the next refresh sort them.
-        cache.active = (flags & 0xff) == 0 && !load.reentered
-            && sameAllocation(view.records(), cache.liveRecords)
-            && sameAllocation(view.roots(), cache.liveRoots);
-        discardParked();
-        clearSort();
-    }
     publishState();
 }
 
 bool parseHook(const char* path, void* records, void* roots)
 {
     const auto parse = native<Parse>(parseRva);
-    if (!enabled || GetCurrentThreadId() != uiThread || !currentLoad
-        || records != &currentLoad->view.records() || roots != &currentLoad->view.roots()) {
+    if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || currentLoad->reentered
+        || records != &currentLoad->view.records() || roots != currentLoad->view.roots()) {
         return parse(path, records, roots);
     }
 
@@ -332,34 +217,52 @@ bool parseHook(const char* path, void* records, void* roots)
     auto& load = *currentLoad;
     FileStamp stamp{};
     const bool haveStamp = readStamp(stamp);
-    if (cache.parked && haveStamp && cache.stamp == stamp
-        && load.view.records().usedBytes == 0 && load.view.roots().usedBytes == 0
-        && validBuffer(load.view.records()) && validBuffer(load.view.roots())) {
-        freeNativeBuffer(load.view.records());
-        freeNativeBuffer(load.view.roots());
-        moveBuffer(load.view.records(), cache.records);
-        moveBuffer(load.view.roots(), cache.roots);
-        cache.parked = false;
-        load.hit = load.parsed = true;
-        load.stamp = stamp;
-        ++hits;
-        return true;
-    }
-
-    discardParked();
-    clearSort();
     ++parses;
     const bool result = parse(path, records, roots);
     FileStamp after{};
     load.parsed = result && haveStamp && readStamp(after) && after == stamp;
     load.stamp = stamp;
+    if (!cache.ordinals.empty() && (!load.parsed || !(cache.stamp == stamp))) clearOrder();
     return result;
+}
+
+bool fullFileOrder(const View& view, const void* data, std::size_t bytes)
+{
+    const auto& visible = view.visible();
+    const auto& records = view.records();
+    return data == visible.data && records.data && visible.data != records.data
+        && visible.usedBytes == int(bytes) && records.usedBytes == int(bytes)
+        && std::memcmp(visible.data, records.data, bytes) == 0;
+}
+
+void rememberOrder(const View& view, std::size_t count, const FileStamp& stamp, const SortSettings& settings)
+{
+    try {
+        // Convert native pointers to file ordinals while both buffers are
+        // live. Only the integer permutation survives the refresh.
+        std::unordered_map<void*, std::uint32_t> positions;
+        positions.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (!positions.emplace(view.records().data[i], i).second) return;
+        }
+        OrderCache next{stamp, settings, {}};
+        next.ordinals.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto source = positions.find(view.visible().data[i]);
+            if (source == positions.end()) return;
+            next.ordinals.push_back(source->second);
+        }
+        cache = std::move(next);
+    } catch (const std::bad_alloc&) {
+        // Native sorting is already complete.
+    }
 }
 
 void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare)
 {
     const auto sort = native<Sort>(sortRva);
-    if (!enabled || GetCurrentThreadId() != uiThread || !currentLoad || !currentLoad->parsed || !data
+    if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || !currentLoad->parsed
+        || currentLoad->reentered || !data
         || stride != sizeof(void*) || count == 0 || count > 2000000
         || compare != native<Compare>(compareRva)) {
         sort(data, count, stride, compare);
@@ -369,33 +272,23 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
     const auto settings = readSortSettings();
     // The name comparator has a small, verified set of inputs. Use REAPER's
     // comparator for rating/favourite sorts, random sorts and custom columns.
-    if (settings.column != 0 || (settings.listFlags & 0x20)) {
-        clearSort();
+    const auto view = currentLoad->view;
+    if (settings.column != 0 || (settings.listFlags & 0x20)
+        || !fullFileOrder(view, data, count * stride)) {
         sort(data, count, stride, compare);
         return;
     }
 
-    auto** rows = static_cast<void**>(data);
-    if (currentLoad->hit && cache.sortSettings == settings
-        && cache.originalOrder.size() == count && cache.sortedOrder.size() == count
-        && std::memcmp(rows, cache.originalOrder.data(), count * stride) == 0) {
-        std::memcpy(rows, cache.sortedOrder.data(), count * stride);
+    const auto stamp = currentLoad->stamp;
+    if (cache.stamp == stamp && cache.sortSettings == settings && cache.ordinals.size() == count) {
+        auto** rows = static_cast<void**>(data);
+        auto* const* records = view.records().data;
+        for (std::size_t i = 0; i < count; ++i) rows[i] = records[cache.ordinals[i]];
         ++sortHits;
         return;
     }
-    try {
-        cache.originalOrder.assign(rows, rows + count);
-    } catch (const std::bad_alloc&) {
-        clearSort();
-    }
     sort(data, count, stride, compare);
-    if (cache.originalOrder.size() != count) return;
-    try {
-        cache.sortedOrder.assign(rows, rows + count);
-        cache.sortSettings = settings;
-    } catch (const std::bad_alloc&) {
-        clearSort();
-    }
+    if (enabled && !currentLoad->reentered) rememberOrder(view, count, stamp, settings);
 }
 
 std::array<Patch, 9> patches{{
@@ -552,10 +445,8 @@ void toggleCache()
     enabled = !enabled;
     setState(section, "enabled", enabled ? "1" : "0", true);
     if (!enabled) {
-        // A modal message inside a refresh can dispatch the action before
-        // the native caller has finished publishing its borrowed pointers.
         if (currentLoad) currentLoad->reentered = true;
-        else disableCache();
+        clearOrder();
     }
     publishState();
     if (refreshToolbar) {
@@ -627,10 +518,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
             unregisterActions();
         }
         removePatches();
-        if (installed == 0 && cache.parked && GetModuleHandleW(moduleName) == reinterpret_cast<HMODULE>(explorer)) {
-            discardParked();
-        }
-        clearSort();
+        clearOrder();
         return 0;
     }
     if (info->caller_version != REAPER_PLUGIN_VERSION || !info->Register || !info->GetFunc) return 0;

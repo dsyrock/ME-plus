@@ -37,7 +37,7 @@ bool ready, busy, enabled = true;
 int picked = -1;
 POINT press{};
 int viewWidth, viewHeight;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 int previewHeight;
 #endif
 Clock::time_point nextPoll{}, nextStat{}, nextPaint{}, openAfter{};
@@ -51,13 +51,25 @@ void hideDrop();
 void selectPreviewRegion(int index);
 bool dragStarted;
 #endif
-void repaint() { if (strip) InvalidateRect(strip, nullptr, FALSE); }
+#ifdef __APPLE__
+bool macOverlayDirty;
+#endif
+void repaint() {
+#ifdef __APPLE__
+    macOverlayDirty = true;
+#else
+    if (strip) InvalidateRect(strip, nullptr, FALSE);
+#endif
+}
 void cancelDrag() {
-    bool wasDragging = picked >= 0;
+    [[maybe_unused]] bool wasDragging = picked >= 0;
     picked = -1;
 #if defined(_WIN32) || defined(__APPLE__)
     hideDrop();
 #endif
+#ifdef __APPLE__
+    stopMacRegionTracking(strip);
+#else
     if (wasDragging && GetCapture() ==
 #ifdef _WIN32
         wave
@@ -65,6 +77,7 @@ void cancelDrag() {
         strip
 #endif
     ) ReleaseCapture();
+#endif
 }
 void resetFile(std::string file) {
     cancelDrag();
@@ -131,14 +144,18 @@ void scanAudio() {
     }
 }
 
+#ifndef __APPLE__
 void fill(HDC dc, RECT r, HBRUSH brush) { FillRect(dc, &r, brush); }
+#endif
 #ifdef _WIN32
 constexpr COLORREF dropColor = RGB(128,128,128);
 constexpr wchar_t className[] = L"ReaperAudioRegionStrip";
 HWND dropPreview;
+std::uintptr_t nativeViewportAddress;
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
 bool reveal;
 constexpr int previewScrollbars = 42169;
-std::uintptr_t nativeViewportAddress;
 int waveformBottom;
 BOOL (WINAPI *getScrollInfo)(HWND,int,LPSCROLLINFO);
 struct WaveView {
@@ -150,13 +167,15 @@ struct WaveView {
 };
 WaveView lastView;
 WaveView waveView() {
+#ifdef _WIN32
     NativeViewport native{};
     if (nativeViewportAddress && readLocalImage(nativeViewportAddress,native) &&
         std::isfinite(native.first) && std::isfinite(native.end) &&
         native.first >= 0 && native.end <= 1.000001 && native.end > native.first)
         return {native.first,native.end-native.first};
+#endif
     // Unknown DLLs can still expose their viewport through an enabled scrollbar.
-    if (GetToggleCommandStateEx(32063,previewScrollbars) != 1) return {};
+    if (!getScrollInfo || GetToggleCommandStateEx(32063,previewScrollbars) != 1) return {};
     SCROLLINFO info{};
     info.cbSize = sizeof(info);
     info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
@@ -172,6 +191,8 @@ int pixelAtFrame(Frame frame, WaveView view, bool right) {
     x = std::clamp(x, -1., double(viewWidth)+1);
     return int(right ? std::ceil(x) : std::floor(x));
 }
+#endif
+#ifdef _WIN32
 void paint(HWND w) {
     PAINTSTRUCT ps{};
     BeginPaint(w,&ps);
@@ -231,7 +252,7 @@ void paint(HWND w) {
     DeleteObject(bitmap);
     DeleteDC(dc);
 }
-#else
+#elif !defined(__APPLE__)
 void paint(HWND w) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(w, &ps);
@@ -286,7 +307,7 @@ void paint(HWND w) {
 #endif
 int hit(int x) {
     if (!ready || !analysis || x < 0 || x >= viewWidth) return -1;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     const auto view = waveView();
     double first = frameAtPixel(x,view);
     double end = frameAtPixel(x+1,view);
@@ -303,6 +324,14 @@ struct Target { MediaTrack* track = nullptr; double time = 0; int lane = -1; };
 bool locate(POINT p, Target& target) {
     char what[128]{};
     target.track = GetThingFromPoint(p.x, p.y, what, sizeof(what));
+#ifdef __APPLE__
+    const auto arrange = GetDlgItem(mainWindow,1000);
+    const auto underMouse = WindowFromPoint(p);
+    const bool overArrange = arrange && (underMouse == arrange || IsChild(arrange,underMouse));
+    if (!overArrange && std::strcmp(what,"arrange") != 0) return false;
+    if (!target.track && overArrange) target.track = GetTrackFromPoint(p.x,p.y,nullptr);
+    if (target.track && target.track == GetMasterTrack(nullptr)) return false;
+#else
     if (target.track) {
         if (std::strcmp(what, "arrange") != 0 || target.track == GetMasterTrack(nullptr)) return false;
     } else {
@@ -315,6 +344,7 @@ bool locate(POINT p, Target& target) {
         GetClientRect(arrange,&bounds);
         if (client.x < 0 || client.y < 0 || client.x >= bounds.right || client.y >= bounds.bottom) return false;
     }
+#endif
     double right = 0;
     GetSet_ArrangeView2(nullptr, false, p.x, p.x+1, &target.time, &right);
     if (GetToggleCommandStateEx(0, 1157) == 1) target.time = SnapToGrid(nullptr, target.time);
@@ -428,29 +458,20 @@ bool insert(const Target& target, int index) {
     return ok;
 }
 bool dragDistance(POINT p) { return std::abs(p.x-press.x) >= 4 || std::abs(p.y-press.y) >= 4; }
-bool handle(HWND w, UINT msg, [[maybe_unused]] WPARAM wp, LPARAM lp) {
+#ifndef __APPLE__
+bool handle(HWND w, UINT msg, WPARAM, LPARAM lp) {
     POINT p{short(LOWORD(lp)), short(HIWORD(lp))};
     switch (msg) {
     case WM_PAINT: paint(w); return true;
     case WM_ERASEBKGND: return true;
     case WM_LBUTTONDOWN:
-#ifdef __APPLE__
-        if (!optionHeld()) return false;
-        dragStarted = false;
-#endif
         picked = hit(p.x);
         if (picked >= 0) {
-#ifdef __APPLE__
-            SetFocus(w);
-#endif
             press = p; SetCapture(w); repaint();
         }
         return true;
     case WM_MOUSEMOVE:
         if (picked >= 0 && dragDistance(p)) {
-#ifdef __APPLE__
-            dragStarted = true;
-#endif
             ClientToScreen(w, &p);
             Target target;
             bool valid = locate(p,target);
@@ -467,9 +488,6 @@ bool handle(HWND w, UINT msg, [[maybe_unused]] WPARAM wp, LPARAM lp) {
         int index = picked;
         bool moved = dragDistance(p);
         cancelDrag();
-#ifdef __APPLE__
-        if (index >= 0 && !moved && !dragStarted) selectPreviewRegion(index);
-#endif
         if (index >= 0 && moved && ready && selected(browser) == current) {
             ClientToScreen(w, &p);
             Target target;
@@ -488,14 +506,11 @@ bool handle(HWND w, UINT msg, [[maybe_unused]] WPARAM wp, LPARAM lp) {
 #ifdef _WIN32
     case WM_CANCELMODE:
         cancelDrag(); repaint(); return true;
-#elif defined(__APPLE__)
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE && picked >= 0) { cancelDrag(); repaint(); return true; }
-        return false;
 #endif
     default: return false;
     }
 }
+#endif
 #if defined(_WIN32) || defined(__APPLE__)
 std::string previewTime(double seconds) {
     const auto minutes = static_cast<long long>(seconds/60);
@@ -580,6 +595,45 @@ HWND makeStrip(HWND parent) {
     if (overlay) DestroyWindow(overlay);
     return nullptr;
 }
+#elif defined(__APPLE__)
+bool macCanStartRegion(int x) { return optionHeld() && hit(x) >= 0; }
+
+bool macBeginRegion(int x, POINT screen) {
+    if (!macCanStartRegion(x)) return false;
+    picked = hit(x);
+    press = screen;
+    dragStarted = false;
+    repaint();
+    return true;
+}
+
+void macMoveRegion(POINT screen) {
+    if (picked < 0 || !dragDistance(screen)) { hideDrop(); return; }
+    dragStarted = true;
+    Target target;
+    if (locate(screen,target)) drawDrop(screen,target);
+    else hideDrop();
+}
+
+void macEndRegion(POINT screen) {
+    if (picked < 0) return;
+    const int index = picked;
+    const bool moved = dragDistance(screen);
+    const bool click = !moved && !dragStarted;
+    cancelDrag();
+    if (click) selectPreviewRegion(index);
+    else if (moved && ready && selected(browser) == current) {
+        Target target;
+        std::error_code ec;
+        if (locate(screen,target) && fs::last_write_time(fs::u8path(path),ec) == modified && !ec)
+            insert(target,index);
+    }
+    repaint();
+}
+
+HWND makeStrip(HWND parent) {
+    return createMacRegionOverlay(parent,{macCanStartRegion,macBeginRegion,macMoveRegion,macEndRegion,cancelDrag});
+}
 #else
 INT_PTR CALLBACK procedure(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m==WM_DESTROY && strip==w) { strip=nullptr; picked=-1; }
@@ -587,12 +641,7 @@ INT_PTR CALLBACK procedure(HWND w, UINT m, WPARAM a, LPARAM b) {
 }
 HWND makeStrip(HWND parent) {
     HWND w = SWELL_CreateDialog(nullptr,nullptr,parent,procedure,0);
-    if (w) {
-        SetWindowLong(w,GWL_ID,viewId);
-#ifdef __APPLE__
-        ShowWindow(w,SW_HIDE);
-#endif
-    }
+    if (w) SetWindowLong(w,GWL_ID,viewId);
     return w;
 }
 #endif
@@ -604,7 +653,12 @@ void detachWave() {
     nativeViewportAddress = 0;
     if (wave && IsWindow(wave)) RemoveWindowSubclass(wave,waveProcedure,viewId);
 #endif
+#ifdef __APPLE__
+    destroyMacRegionOverlay(strip);
+    reveal = false;
+#else
     if (strip && IsWindow(strip)) DestroyWindow(strip);
+#endif
     strip = wave = nullptr;
 }
 void detach() {
@@ -624,7 +678,13 @@ void poll() {
     }
     if (!browser) return;
     HWND preview = GetDlgItem(browser,1046);
-    if (preview != wave || !strip || !IsWindow(strip)) {
+    if (preview != wave || !strip ||
+#ifdef __APPLE__
+        !macRegionOverlayAttached(strip,wave)
+#else
+        !IsWindow(strip)
+#endif
+    ) {
         detachWave();
         wave = preview;
         strip = wave ? makeStrip(wave) : nullptr;
@@ -634,19 +694,13 @@ void poll() {
         viewWidth = viewHeight = -1;
     }
     if (!strip) return;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     RECT r{};
     GetClientRect(wave,&r);
     // Keep the upper preview available for REAPER's zoom, seek and time selection.
     int height = std::min(38, std::max(1, int(r.bottom)/3));
     if (viewWidth != r.right || viewHeight != height || previewHeight != r.bottom)
-        SetWindowPos(strip,HWND_TOP,0,r.bottom-height,r.right,height,
-#ifdef __APPLE__
-            SWP_NOACTIVATE
-#else
-            SWP_NOACTIVATE | SWP_SHOWWINDOW
-#endif
-        );
+        SetWindowPos(strip,HWND_TOP,0,r.bottom-height,r.right,height,SWP_NOACTIVATE | SWP_SHOWWINDOW);
     viewWidth = r.right; viewHeight = height; previewHeight = r.bottom;
 #endif
     auto s = selected(browser);
@@ -689,6 +743,35 @@ void updateOverlay() {
         repaint();
     }
 }
+#elif defined(__APPLE__)
+void updateOverlay() {
+    RECT r{};
+    GetClientRect(wave,&r);
+    // Leave the native time ruler below the overlay.
+    const int bottom = std::max(0,int(r.bottom)-18);
+    const bool show = IsWindowVisible(wave) && optionHeld() && ready && analysis &&
+                      r.right > 0 && bottom > 4;
+    const auto view = waveView();
+    if (!macOverlayDirty && viewWidth == r.right && waveformBottom == bottom &&
+        reveal == show && view == lastView) return;
+    viewWidth = r.right;
+    waveformBottom = bottom;
+    reveal = show;
+    lastView = view;
+    macOverlayDirty = false;
+    std::vector<MacRegionBox> boxes;
+    if (show) {
+        const auto& spans = analysis->intervals;
+        auto first = std::lower_bound(spans.begin(),spans.end(),frameAtPixel(0,view),
+            [](Interval span,double frame){ return span.end <= frame; });
+        const double viewEnd = frameAtPixel(viewWidth,view);
+        for (auto i=first; i!=spans.end() && i->first < viewEnd; ++i) {
+            boxes.push_back({pixelAtFrame(i->first,view,false),pixelAtFrame(i->end,view,true),
+                             i-spans.begin()==picked});
+        }
+    }
+    updateMacRegionOverlay(strip,viewWidth,waveformBottom,reveal,std::move(boxes));
+}
 #endif
 void timer() {
     if (!enabled || busy) return;
@@ -707,13 +790,9 @@ void timer() {
             updateOverlay();
             if (reveal) scanAudio();
 #elif defined(__APPLE__)
-            if (picked >= 0 && !macExplorerActive(browser)) cancelDrag();
-            const bool show = IsWindowVisible(wave) && (picked >= 0 || optionHeld());
-            if (show != bool(IsWindowVisible(strip))) {
-                ShowWindow(strip,show ? SW_SHOWNOACTIVATE : SW_HIDE);
-                if (show) repaint();
-            }
-            if (show && picked < 0) scanAudio();
+            if (picked >= 0 && !macApplicationActive()) cancelDrag();
+            if (IsWindowVisible(wave) && optionHeld() && picked < 0) scanAudio();
+            updateOverlay();
 #else
             scanAudio();
 #endif
@@ -800,6 +879,8 @@ bool load(REAPER_PLUGIN_HINSTANCE inst, reaper_plugin_info_t& info) {
     klass.hCursor = LoadCursor(nullptr,IDC_ARROW);
     klass.lpszClassName = className;
     if (!RegisterClassW(&klass)) return false;
+#elif defined(__APPLE__)
+    getScrollInfo = reinterpret_cast<decltype(getScrollInfo)>(rec->GetFunc("CoolSB_GetScrollInfo"));
 #endif
     host = rec;
     enabled = std::strcmp(GetExtState(section,"enabled"),"0") != 0;

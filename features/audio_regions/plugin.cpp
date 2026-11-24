@@ -11,6 +11,8 @@
 #ifdef _WIN32
 #include <commctrl.h>
 #include "native_view.hpp"
+#elif defined(__APPLE__)
+#include "mac_preview.hpp"
 #endif
 
 namespace {
@@ -44,14 +46,16 @@ constexpr int mediaExplorerSection = 32063;
 custom_action_register_t explorerActions[2]{};
 int explorerCommands[2]{};
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 void hideDrop();
+void selectPreviewRegion(int index);
+bool dragStarted;
 #endif
 void repaint() { if (strip) InvalidateRect(strip, nullptr, FALSE); }
 void cancelDrag() {
     bool wasDragging = picked >= 0;
     picked = -1;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     hideDrop();
 #endif
     if (wasDragging && GetCapture() ==
@@ -133,7 +137,6 @@ constexpr COLORREF dropColor = RGB(128,128,128);
 constexpr wchar_t className[] = L"ReaperAudioRegionStrip";
 HWND dropPreview;
 bool reveal;
-bool dragStarted;
 constexpr int previewScrollbars = 42169;
 std::uintptr_t nativeViewportAddress;
 int waveformBottom;
@@ -328,6 +331,11 @@ bool altHeld() {
            (GetAsyncKeyState(VK_MENU) & 0x8000);
 }
 void hideDrop() { if (dropPreview) ShowWindow(dropPreview,SW_HIDE); }
+#elif defined(__APPLE__)
+bool optionHeld() { return macExplorerActive(browser) && (GetAsyncKeyState(VK_MENU) & 0x8000); }
+void hideDrop() { hideMacDropPreview(); }
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
 void drawDrop(POINT p, const Target& target) {
     HWND arrange = GetDlgItem(mainWindow,1000);
     double viewStart = 0, viewEnd = 0;
@@ -342,7 +350,12 @@ void drawDrop(POINT p, const Target& target) {
     double end = start + (span.end-span.first)/rate*zoom;
     int left = int(std::clamp(std::floor(start),0.,double(bounds.right)));
     int right = int(std::clamp(std::ceil(end),0.,double(bounds.right)));
-    int top = p.y, height = MulDiv(48,GetDpiForWindow(arrange),96);
+    int top = p.y;
+#ifdef _WIN32
+    int height = MulDiv(48,GetDpiForWindow(arrange),96);
+#else
+    int height = 48;
+#endif
     if (target.track) {
         top = int(GetMediaTrackInfo_Value(target.track,"I_TCPY"));
         height = int(GetMediaTrackInfo_Value(target.track,"I_TCPH"));
@@ -359,6 +372,7 @@ void drawDrop(POINT p, const Target& target) {
     int bottom = std::min(int(bounds.bottom),top+height);
     top = std::max(0,top);
     if (right <= left || bottom <= top) return hideDrop();
+#ifdef _WIN32
     if (!dropPreview) {
         dropPreview = CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,
             className,L"Audio region drop preview",WS_POPUP,0,0,1,1,mainWindow,nullptr,instance,nullptr);
@@ -372,6 +386,9 @@ void drawDrop(POINT p, const Target& target) {
     ClientToScreen(arrange,&origin);
     SetWindowPos(dropPreview,HWND_TOPMOST,origin.x,origin.y,right-left,bottom-top,
         SWP_NOACTIVATE|SWP_SHOWWINDOW);
+#else
+    showMacDropPreview(arrange,{left,top,right,bottom});
+#endif
 }
 #endif
 bool insert(const Target& target, int index) {
@@ -411,26 +428,38 @@ bool insert(const Target& target, int index) {
     return ok;
 }
 bool dragDistance(POINT p) { return std::abs(p.x-press.x) >= 4 || std::abs(p.y-press.y) >= 4; }
-bool handle(HWND w, UINT msg, WPARAM, LPARAM lp) {
+bool handle(HWND w, UINT msg, [[maybe_unused]] WPARAM wp, LPARAM lp) {
     POINT p{short(LOWORD(lp)), short(HIWORD(lp))};
     switch (msg) {
     case WM_PAINT: paint(w); return true;
     case WM_ERASEBKGND: return true;
     case WM_LBUTTONDOWN:
+#ifdef __APPLE__
+        if (!optionHeld()) return false;
+        dragStarted = false;
+#endif
         picked = hit(p.x);
-        if (picked >= 0) { press = p; SetCapture(w); repaint(); }
+        if (picked >= 0) {
+#ifdef __APPLE__
+            SetFocus(w);
+#endif
+            press = p; SetCapture(w); repaint();
+        }
         return true;
     case WM_MOUSEMOVE:
         if (picked >= 0 && dragDistance(p)) {
+#ifdef __APPLE__
+            dragStarted = true;
+#endif
             ClientToScreen(w, &p);
             Target target;
             bool valid = locate(p,target);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
             if (valid) drawDrop(p,target); else hideDrop();
 #endif
             SetCursor(LoadCursor(nullptr, valid ? IDC_SIZEALL : IDC_NO));
         }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         else hideDrop();
 #endif
         return true;
@@ -438,6 +467,9 @@ bool handle(HWND w, UINT msg, WPARAM, LPARAM lp) {
         int index = picked;
         bool moved = dragDistance(p);
         cancelDrag();
+#ifdef __APPLE__
+        if (index >= 0 && !moved && !dragStarted) selectPreviewRegion(index);
+#endif
         if (index >= 0 && moved && ready && selected(browser) == current) {
             ClientToScreen(w, &p);
             Target target;
@@ -449,23 +481,27 @@ bool handle(HWND w, UINT msg, WPARAM, LPARAM lp) {
         return true;
     }
     case WM_CAPTURECHANGED:
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         hideDrop();
 #endif
         picked = -1; repaint(); return true;
 #ifdef _WIN32
     case WM_CANCELMODE:
         cancelDrag(); repaint(); return true;
+#elif defined(__APPLE__)
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE && picked >= 0) { cancelDrag(); repaint(); return true; }
+        return false;
 #endif
     default: return false;
     }
 }
-#ifdef _WIN32
-std::wstring previewTime(double seconds) {
+#if defined(_WIN32) || defined(__APPLE__)
+std::string previewTime(double seconds) {
     const auto minutes = static_cast<long long>(seconds/60);
-    std::wostringstream out;
+    std::ostringstream out;
     out.imbue(std::locale::classic());
-    out << minutes << L':' << std::fixed << std::setprecision(9) << seconds-minutes*60.;
+    out << minutes << ':' << std::fixed << std::setprecision(9) << seconds-minutes*60.;
     return out.str();
 }
 void selectPreviewRegion(int index) {
@@ -476,11 +512,18 @@ void selectPreviewRegion(int index) {
     const auto span = analysis->intervals[index];
     const auto startText = previewTime(span.first/rate);
     const auto endText = previewTime(span.end/rate);
-    if (SetWindowTextW(start,startText.c_str()) && SetWindowTextW(end,endText.c_str())) {
+#ifdef _WIN32
+    const bool entered = SetWindowTextA(start,startText.c_str()) && SetWindowTextA(end,endText.c_str());
+#else
+    const bool entered = SetWindowText(start,startText.c_str()) && SetWindowText(end,endText.c_str());
+#endif
+    if (entered) {
         // REAPER debounces EN_CHANGE and then commits both native time fields.
         SendMessage(browser,WM_COMMAND,MAKEWPARAM(endId,EN_CHANGE),reinterpret_cast<LPARAM>(end));
     }
 }
+#endif
+#ifdef _WIN32
 LRESULT CALLBACK procedure(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m==WM_PAINT) {
         if (w == dropPreview) {
@@ -544,7 +587,12 @@ INT_PTR CALLBACK procedure(HWND w, UINT m, WPARAM a, LPARAM b) {
 }
 HWND makeStrip(HWND parent) {
     HWND w = SWELL_CreateDialog(nullptr,nullptr,parent,procedure,0);
-    if (w) SetWindowLong(w,GWL_ID,viewId);
+    if (w) {
+        SetWindowLong(w,GWL_ID,viewId);
+#ifdef __APPLE__
+        ShowWindow(w,SW_HIDE);
+#endif
+    }
     return w;
 }
 #endif
@@ -592,7 +640,13 @@ void poll() {
     // Keep the upper preview available for REAPER's zoom, seek and time selection.
     int height = std::min(38, std::max(1, int(r.bottom)/3));
     if (viewWidth != r.right || viewHeight != height || previewHeight != r.bottom)
-        SetWindowPos(strip,HWND_TOP,0,r.bottom-height,r.right,height,SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowPos(strip,HWND_TOP,0,r.bottom-height,r.right,height,
+#ifdef __APPLE__
+            SWP_NOACTIVATE
+#else
+            SWP_NOACTIVATE | SWP_SHOWWINDOW
+#endif
+        );
     viewWidth = r.right; viewHeight = height; previewHeight = r.bottom;
 #endif
     auto s = selected(browser);
@@ -652,6 +706,14 @@ void timer() {
 #ifdef _WIN32
             updateOverlay();
             if (reveal) scanAudio();
+#elif defined(__APPLE__)
+            if (picked >= 0 && !macExplorerActive(browser)) cancelDrag();
+            const bool show = IsWindowVisible(wave) && (picked >= 0 || optionHeld());
+            if (show != bool(IsWindowVisible(strip))) {
+                ShowWindow(strip,show ? SW_SHOWNOACTIVATE : SW_HIDE);
+                if (show) repaint();
+            }
+            if (show && picked < 0) scanAudio();
 #else
             scanAudio();
 #endif

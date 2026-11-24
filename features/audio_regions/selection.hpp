@@ -35,7 +35,12 @@ struct Selection {
 };
 inline Selection selected(HWND browser) {
     HWND list = GetDlgItem(browser, 1001);
+#ifdef __APPLE__
+    int row = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+    if (row >= 0 && !(ListView_GetItemState(list,row,LVIS_SELECTED) & LVIS_SELECTED)) row = -1;
+#else
     int row = ListView_GetNextItem(list, -1, LVNI_SELECTED | LVNI_FOCUSED);
+#endif
     if (row < 0) row = ListView_GetNextItem(list, -1, LVNI_SELECTED);
     if (row < 0) return {};
     return {row, controlText(GetDlgItem(browser, 1002)), controlText(list, row), controlText(list, row, 3)};

@@ -37,6 +37,7 @@ constexpr std::size_t parseRva = 0x0f9b4;
 constexpr std::size_t sortRva = 0x14630;
 constexpr std::size_t compareRva = 0x16620;
 constexpr std::size_t modelRva = 0x10e0a0;
+constexpr std::uint64_t minimumLibrarySize = 50ULL * 1024 * 1024;
 
 using Address = std::uintptr_t;
 using Refresh = void(*)(void*, unsigned, const void*, const void*);
@@ -60,6 +61,7 @@ struct View {
 };
 
 struct OrderCache {
+    std::filesystem::path directory;
     FileStamp stamp{};
     SortSettings sortSettings{};
     std::vector<std::uint32_t> ordinals;
@@ -67,6 +69,9 @@ struct OrderCache {
 
 struct Load {
     View view;
+    std::filesystem::path source;
+    std::filesystem::path directory;
+    bool legacy = false;
     bool parsed = false;
     bool reentered = false;
     FileStamp stamp{};
@@ -83,8 +88,7 @@ DWORD uiThread = 0;
 void* relayPage = nullptr;
 std::size_t installed = 0;
 reaper_plugin_info_t host{};
-std::wstring databasePath;
-std::filesystem::path snapshotPath, orderPath;
+std::filesystem::path cacheDirectory, legacyDirectory, legacySource;
 SetState setState = nullptr;
 RefreshToolbar refreshToolbar = nullptr;
 gaccel_register_t mainAction{};
@@ -98,6 +102,7 @@ Load* currentLoad = nullptr;
 unsigned parses = 0, sortHits = 0, invalidations = 0;
 unsigned refreshes = 0, parserCalls = 0;
 unsigned snapshotHits = 0, snapshotWrites = 0, diskSortHits = 0;
+unsigned smallLibraries = 0, migrations = 0;
 double lastLoadMs = 0.0, lastWriteMs = 0.0;
 media_cache::ReadMetrics lastRead;
 
@@ -117,23 +122,97 @@ std::wstring utf8ToWide(const char* text)
     return result;
 }
 
-bool readStamp(FileStamp& stamp)
+std::uint64_t fileSize(const FileStamp& stamp)
 {
-    const HANDLE file = CreateFileW(databasePath.c_str(), FILE_READ_ATTRIBUTES,
+    return (std::uint64_t(stamp.sizeHigh) << 32) | stamp.sizeLow;
+}
+
+bool readStamp(const std::filesystem::path& path, FileStamp& stamp, std::wstring* canonical = nullptr)
+{
+    const HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     BY_HANDLE_FILE_INFORMATION info{};
     const bool ok = GetFileInformationByHandle(file, &info) && !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    wchar_t resolved[32768];
+    DWORD length = 0;
+    if (ok) {
+        stamp = {info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
+            info.nFileSizeHigh, info.nFileSizeLow, info.ftLastWriteTime};
+        if (canonical && fileSize(stamp) >= minimumLibrarySize) {
+            length = GetFinalPathNameByHandleW(file, resolved, DWORD(std::size(resolved)), FILE_NAME_NORMALIZED);
+            if (!length) {
+                length = GetFinalPathNameByHandleW(file, resolved, DWORD(std::size(resolved)), FILE_NAME_OPENED);
+            }
+        }
+    }
     CloseHandle(file);
-    if (ok) stamp = {info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
-        info.nFileSizeHigh, info.nFileSizeLow, info.ftLastWriteTime};
+    if (canonical && length && length < std::size(resolved)) canonical->assign(resolved, length);
     return ok;
 }
 
 bool unchanged(const FileStamp& stamp)
 {
     FileStamp now{};
-    return readStamp(now) && now == stamp;
+    return currentLoad && readStamp(currentLoad->source, now) && now == stamp;
+}
+
+std::string sha256Hex(const void* bytes, ULONG size)
+{
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
+    std::array<unsigned char, 32> digest{};
+    const auto result = BCryptHash(algorithm, nullptr, 0,
+        const_cast<PUCHAR>(static_cast<const unsigned char*>(bytes)), size,
+        digest.data(), ULONG(digest.size()));
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (result != 0) return {};
+    char printable[65]{};
+    constexpr char hex[] = "0123456789abcdef";
+    for (std::size_t index = 0; index < digest.size(); ++index) {
+        printable[index * 2] = hex[digest[index] >> 4];
+        printable[index * 2 + 1] = hex[digest[index] & 15];
+    }
+    return printable;
+}
+
+bool identifyLibrary(const char* path, Load& load)
+{
+    if (!path) return false;
+    const std::filesystem::path source(utf8ToWide(path));
+    if (_wcsicmp(source.extension().c_str(), L".ReaperFileList") != 0) return false;
+    std::wstring canonical;
+    if (!readStamp(source, load.stamp, &canonical)) return false;
+    if (fileSize(load.stamp) < minimumLibrarySize) {
+        ++smallLibraries;
+        return false;
+    }
+    // The opened file's canonical path distinguishes same-named libraries.
+    if (canonical.empty()) return false;
+    const auto key = sha256Hex(canonical.data(), ULONG(canonical.size() * sizeof(wchar_t)));
+    if (key.empty()) return false;
+    load.source = source;
+    load.directory = cacheDirectory / key;
+    load.legacy = _wcsicmp(source.lexically_normal().c_str(), legacySource.c_str()) == 0;
+    return true;
+}
+
+void moveLegacy(const std::filesystem::path& from, const std::filesystem::path& to)
+{
+    std::error_code error;
+    std::filesystem::create_directories(to.parent_path(), error);
+    if (!error && MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        ++migrations;
+    }
+}
+
+std::filesystem::path getOrderPath(const Load& load, const SortSettings& settings)
+{
+    const auto name = L"order-" + std::to_wstring(settings.column)
+        + L"-" + std::to_wstring(settings.reverse)
+        + L"-" + std::to_wstring(settings.listFlags)
+        + L"-" + std::to_wstring(settings.explorerFlags) + L".order";
+    return load.directory / name;
 }
 
 double durationMs(Clock::time_point start)
@@ -161,11 +240,12 @@ void publishState()
         "{\"status\":\"%s\",\"enabled\":%s,\"parses\":%u,\"sort_hits\":%u,"
         "\"order_bytes\":%zu,\"invalidations\":%u,\"refreshes\":%u,\"parser_calls\":%u,"
         "\"snapshot_hits\":%u,\"snapshot_writes\":%u,\"disk_sort_hits\":%u,"
+        "\"small_libraries\":%u,\"migrations\":%u,"
         "\"load_ms\":%.3f,\"write_ms\":%.3f,\"read_ms\":%.3f,\"decompress_ms\":%.3f,\"verify_ms\":%.3f}",
         enabled ? installStatus : "disabled", enabled ? "true" : "false",
         parses, sortHits, cache.ordinals.capacity() * sizeof(std::uint32_t),
         invalidations, refreshes, parserCalls,
-        snapshotHits, snapshotWrites, diskSortHits, lastLoadMs, lastWriteMs,
+        snapshotHits, snapshotWrites, diskSortHits, smallLibraries, migrations, lastLoadMs, lastWriteMs,
         lastRead.readMs, lastRead.decompressMs, lastRead.verifyMs);
     setState(section, "status", message, false);
 }
@@ -184,7 +264,8 @@ void refreshHook(void* model, unsigned flags, const void* selection, const void*
     }
 
     ++refreshes;
-    Load load{{static_cast<std::byte*>(model)}};
+    Load load{};
+    load.view.state = static_cast<std::byte*>(model);
     currentLoad = &load;
     refresh(model, flags, selection, scroll);
     currentLoad = nullptr;
@@ -201,45 +282,52 @@ bool parseHook(const char* path, void* records, void* roots)
     }
 
     ++parserCalls;
-    wchar_t parsedPath[32768];
-    if (!path || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-            parsedPath, int(std::size(parsedPath)))
-        || _wcsicmp(parsedPath, databasePath.c_str()) != 0) {
-        return parse(path, records, roots);
-    }
     auto& load = *currentLoad;
-    FileStamp stamp{};
-    const bool haveStamp = readStamp(stamp);
+    std::filesystem::path snapshotPath;
+    try {
+        if (identifyLibrary(path, load)) snapshotPath = load.directory / L"records.snapshot";
+    } catch (const std::bad_alloc&) {
+        // Caching is optional when a path or key cannot be allocated.
+    }
+    if (snapshotPath.empty()) return parse(path, records, roots);
+    const auto& stamp = load.stamp;
     auto& nativeRecords = *static_cast<Buffer*>(records);
     auto& nativeRoots = *static_cast<Buffer*>(roots);
-    load.stamp = stamp;
-    if (!cache.ordinals.empty() && (!haveStamp || !(cache.stamp == stamp))) clearOrder();
+    if (!cache.ordinals.empty() && cache.directory == load.directory && !(cache.stamp == stamp)) clearOrder();
     const auto start = Clock::now();
     lastWriteMs = 0.0;
     lastRead = {};
-    if (haveStamp) {
-        const media_cache::NativeApi api{
-            native<void*(*)(std::size_t)>(0xb8de0),
-            native<void(*)(void*)>(0xb8280),
-            native<void(*)(void*)>(0x17590),
-            native<void(*)(void*, const char*, const char*, char)>(0x10fb8)
+    const media_cache::NativeApi api{
+        native<void*(*)(std::size_t)>(0xb8de0),
+        native<void(*)(void*)>(0xb8280),
+        native<void(*)(void*)>(0x17590),
+        native<void(*)(void*, const char*, const char*, char)>(0x10fb8)
+    };
+    try {
+        auto readSnapshot = [&](const std::filesystem::path& file) {
+            return media_cache::readSnapshot(file, stamp, api, nativeRecords, nativeRoots, unchanged, lastRead);
         };
-        try {
-            if (media_cache::readSnapshot(snapshotPath, stamp, api, nativeRecords, nativeRoots, unchanged, lastRead)) {
-                load.parsed = true;
-                ++snapshotHits;
-                lastLoadMs = durationMs(start);
-                return true;
+        load.parsed = readSnapshot(snapshotPath);
+        if (!load.parsed && load.legacy) {
+            const auto old = legacyDirectory / L"06.snapshot";
+            load.parsed = readSnapshot(old);
+            if (load.parsed) {
+                moveLegacy(old, snapshotPath);
             }
-        } catch (const std::bad_alloc&) {
-            // Temporary native records are released by the snapshot reader.
         }
+    } catch (const std::bad_alloc&) {
+        // A failed restore discards its temporary native records.
+    }
+    if (load.parsed) {
+        ++snapshotHits;
+        lastLoadMs = durationMs(start);
+        return true;
     }
 
     ++parses;
     const bool result = parse(path, records, roots);
     lastLoadMs = durationMs(start);
-    load.parsed = result && haveStamp && unchanged(stamp);
+    load.parsed = result && unchanged(stamp);
     if (load.parsed && enabled && !load.reentered) {
         const auto writing = Clock::now();
         try {
@@ -261,9 +349,10 @@ bool fullFileOrder(const View& view, const void* data, std::size_t bytes)
         && std::memcmp(visible.data, records.data, bytes) == 0;
 }
 
-void rememberOrder(const View& view, std::size_t count, const FileStamp& stamp, const SortSettings& settings)
+void rememberOrder(const Load& load, std::size_t count, const SortSettings& settings)
 {
     try {
+        const auto& view = load.view;
         // Convert native pointers to file ordinals while both buffers are
         // live. Only the integer permutation survives the refresh.
         std::unordered_map<void*, std::uint32_t> positions;
@@ -271,7 +360,7 @@ void rememberOrder(const View& view, std::size_t count, const FileStamp& stamp, 
         for (std::uint32_t i = 0; i < count; ++i) {
             if (!positions.emplace(view.records().data[i], i).second) return;
         }
-        OrderCache next{stamp, settings, {}};
+        OrderCache next{load.directory, load.stamp, settings, {}};
         next.ordinals.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
             const auto source = positions.find(view.visible().data[i]);
@@ -279,7 +368,7 @@ void rememberOrder(const View& view, std::size_t count, const FileStamp& stamp, 
             next.ordinals.push_back(source->second);
         }
         cache = std::move(next);
-        media_cache::writeOrder(orderPath, stamp, settings, cache.ordinals);
+        media_cache::writeOrder(getOrderPath(load, settings), load.stamp, settings, cache.ordinals);
     } catch (const std::bad_alloc&) {
         // Native sorting is already complete.
     }
@@ -290,7 +379,7 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
     const auto sort = native<Sort>(sortRva);
     if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || !currentLoad->parsed
         || currentLoad->reentered || !data
-        || stride != sizeof(void*) || count == 0 || count > 2000000
+        || stride != sizeof(void*) || count == 0 || count > media_cache::maxBufferRows
         || compare != native<Compare>(compareRva)) {
         sort(data, count, stride, compare);
         return;
@@ -306,11 +395,23 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
         return;
     }
 
-    const auto stamp = currentLoad->stamp;
-    if (!(cache.stamp == stamp && cache.sortSettings == settings && cache.ordinals.size() == count)) {
+    const auto& load = *currentLoad;
+    const auto& stamp = load.stamp;
+    auto matches = [&] {
+        return cache.directory == load.directory && cache.stamp == stamp
+            && cache.sortSettings == settings && cache.ordinals.size() == count;
+    };
+    if (!matches()) {
         try {
-            OrderCache saved{stamp, settings, {}};
-            if (media_cache::readOrder(orderPath, stamp, settings, count, saved.ordinals)) {
+            const auto orderPath = getOrderPath(load, settings);
+            OrderCache saved{load.directory, stamp, settings, {}};
+            bool found = media_cache::readOrder(orderPath, stamp, settings, count, saved.ordinals);
+            if (!found && load.legacy) {
+                const auto old = legacyDirectory / L"06.order";
+                found = media_cache::readOrder(old, stamp, settings, count, saved.ordinals);
+                if (found) moveLegacy(old, orderPath);
+            }
+            if (found) {
                 cache = std::move(saved);
                 ++diskSortHits;
             }
@@ -318,7 +419,7 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
             // Native sorting remains available.
         }
     }
-    if (cache.stamp == stamp && cache.sortSettings == settings && cache.ordinals.size() == count) {
+    if (matches()) {
         auto** rows = static_cast<void**>(data);
         auto* const* records = view.records().data;
         for (std::size_t i = 0; i < count; ++i) rows[i] = records[cache.ordinals[i]];
@@ -326,7 +427,7 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
         return;
     }
     sort(data, count, stride, compare);
-    if (enabled && !currentLoad->reentered) rememberOrder(view, count, stamp, settings);
+    if (enabled && !load.reentered) rememberOrder(load, count, settings);
 }
 
 std::array<Patch, 9> patches{{
@@ -352,20 +453,7 @@ bool expectedImage(HMODULE module)
     file.seekg(0);
     if (!file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) return false;
 
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return false;
-    std::array<unsigned char, 32> digest{};
-    const auto result = BCryptHash(algorithm, nullptr, 0, bytes.data(), ULONG(bytes.size()),
-        digest.data(), ULONG(digest.size()));
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (result != 0) return false;
-    char printable[65]{};
-    constexpr char hex[] = "0123456789abcdef";
-    for (std::size_t index = 0; index < digest.size(); ++index) {
-        printable[index * 2] = hex[digest[index] >> 4];
-        printable[index * 2 + 1] = hex[digest[index] & 15];
-    }
-    return std::strcmp(printable, originalDigest) == 0;
+    return sha256Hex(bytes.data(), ULONG(bytes.size())) == originalDigest;
 }
 
 void* allocateNearby()
@@ -570,10 +658,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
             || std::strcmp(getVersion(), "7.82/x64") != 0) return 0;
         const auto resource = utf8ToWide(getResource());
         if (resource.empty()) return 0;
-        databasePath = resource + L"\\MediaDB\\06.ReaperFileList";
-        const auto cacheDirectory = std::filesystem::path(resource) / L"MEPlusNativeCache";
-        snapshotPath = cacheDirectory / L"06.snapshot";
-        orderPath = cacheDirectory / L"06.order";
+        const std::filesystem::path root(resource);
+        cacheDirectory = root / L"UserPlugins" / L"MEPlusNativeCache";
+        legacyDirectory = root / L"MEPlusNativeCache";
+        legacySource = (root / L"MediaDB" / L"06.ReaperFileList").lexically_normal();
         host = *info;
         enabled = std::strcmp(getState(section, "enabled"), "0") != 0;
         if (!registerActions() || !host.Register("timer", reinterpret_cast<void*>(timer))) {

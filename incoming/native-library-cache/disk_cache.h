@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 namespace media_cache {
@@ -30,6 +31,8 @@ struct Buffer {
     int usedBytes;
     int granularity;
 };
+
+constexpr std::size_t maxBufferRows = std::numeric_limits<int>::max() / sizeof(void*);
 
 struct NativeApi {
     void* (*allocate)(std::size_t);

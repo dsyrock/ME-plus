@@ -19,7 +19,6 @@ constexpr std::uint64_t orderMagic = 0x3152444f4350454d;
 constexpr std::size_t chunkSize = 1024 * 1024;
 constexpr std::size_t maxChunkSize = 8 * chunkSize;
 constexpr std::size_t maxTextSize = 8192;
-constexpr std::size_t maxRows = 2000000;
 constexpr std::size_t metadataSlots = 19;
 constexpr std::uint32_t hasMetadata = 1U << 31;
 constexpr std::uint32_t metadataBits = (1U << metadataSlots) - 1U;
@@ -418,7 +417,7 @@ bool writeSnapshot(const std::filesystem::path& path, const FileStamp& stamp,
     if (!valid(records, sizeof(void*)) || !valid(roots, sizeof(void*))) return false;
     const auto count = std::uint32_t(records.usedBytes / sizeof(void*));
     const auto rootCount = std::uint32_t(roots.usedBytes / sizeof(void*));
-    if (!count || count > maxRows || rootCount > maxRows) return false;
+    if (!count || count > maxBufferRows || rootCount > maxBufferRows) return false;
     AtomicOutput out(path);
     if (!out.file || !writeValue(out.file, SnapshotHeader{snapshotMagic, stamp, rootCount, count})) return false;
     BlockWriter writer(out.file);
@@ -440,8 +439,10 @@ bool readSnapshot(const std::filesystem::path& path, const FileStamp& stamp,
         || !valid(roots, sizeof(void*))) return false;
     std::ifstream file(path, std::ios::binary);
     SnapshotHeader header{};
+    const auto sourceBytes = (std::uint64_t(stamp.sizeHigh) << 32) | stamp.sizeLow;
     if (!file || !readValue(file, header) || header.magic != snapshotMagic || !(header.stamp == stamp)
-        || !header.records || header.records > maxRows || header.roots > maxRows) return false;
+        || !header.records || header.records > maxBufferRows || header.roots > maxBufferRows
+        || (std::uint64_t(header.records) + header.roots) > sourceBytes / 5) return false;
     BlockReader reader(file, metrics);
     NativeArray rootArray(api, header.roots, roots.granularity, api.release);
     NativeArray recordArray(api, header.records, records.granularity, api.releaseRecord);
@@ -463,7 +464,7 @@ bool readSnapshot(const std::filesystem::path& path, const FileStamp& stamp,
 bool readOrder(const std::filesystem::path& path, const FileStamp& stamp,
     const SortSettings& settings, std::size_t count, std::vector<std::uint32_t>& ordinals)
 {
-    if (count > maxRows) return false;
+    if (count > maxBufferRows) return false;
     std::ifstream file(path, std::ios::binary);
     OrderHeader header{};
     if (!file || !readValue(file, header) || header.magic != orderMagic || !(header.stamp == stamp)
@@ -487,7 +488,7 @@ bool readOrder(const std::filesystem::path& path, const FileStamp& stamp,
 bool writeOrder(const std::filesystem::path& path, const FileStamp& stamp,
     const SortSettings& settings, const std::vector<std::uint32_t>& order)
 {
-    if (order.size() > maxRows) return false;
+    if (order.size() > maxBufferRows) return false;
     OrderHeader header{orderMagic, stamp, settings.column, std::uint32_t(settings.reverse),
         settings.listFlags, settings.explorerFlags, std::uint32_t(order.size()), {}};
     const auto bytes = order.size() * sizeof(order[0]);

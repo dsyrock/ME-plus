@@ -1,6 +1,6 @@
 # Media Explorer 大型数据库磁盘缓存
 
-扩展在 Windows x64 的 REAPER 7.82 进程内为大型媒体数据库生成磁盘快照和排序索引。树快捷项、搜索、列表发布和媒体操作由原生 Media Explorer 提供。`.ReaperFileList` 文件达到 50 MiB（52,428,800 字节）时自动启用缓存。小于该分界的库走原生流程。
+扩展支持已验证的 Windows x64 REAPER 7.82 和 7.86，为大型媒体数据库生成磁盘快照和排序索引。树快捷项、搜索、列表发布和媒体操作由原生 Media Explorer 提供。`.ReaperFileList` 文件达到 50 MiB（52,428,800 字节）时自动启用缓存。小于该分界的库走原生流程。
 
 ## 构建与启用
 
@@ -22,7 +22,7 @@ cmake --install incoming/native-library-cache/build/current --config Release --p
 
 符合条件的全库排序按排序设置保存在对应库的子目录。当前支持文件名和本机已验证的第 13 号排序列。应用索引前，扩展会核对数据库身份、排序设置和完整输入顺序。筛选结果和其他排序继续走原生逻辑。
 
-旧版本在资源目录根部生成的 `MEPlusNativeCache/06.snapshot` 和 `06.order` 会在使用时校验。匹配当前数据库和排序设置的文件可以直接命中，并迁到新目录。
+7.82 使用原有缓存目录。它会校验早期版本在资源目录根部生成的 `MEPlusNativeCache/06.snapshot` 和 `06.order`，匹配当前数据库和排序设置的文件可以直接命中并迁到新目录。7.86 使用 `UserPlugins/MEPlusNativeCache/7.86`，首次打开大库时会建立自己的缓存。
 
 切离大库后，文件记录和元数据由 REAPER 正常释放。磁盘文件可跨 REAPER 重启复用。测试的 1,356,223 条记录及一种排序占用约 47.2 MiB 磁盘空间，运行期间保留最后命中的一份排序索引。
 

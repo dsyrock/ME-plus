@@ -31,13 +31,38 @@ constexpr char actionLabel[] = "ME+: Toggle native library cache";
 constexpr char mainActionName[] = "ME_NATIVE_LIBRARY_CACHE_TOGGLE";
 constexpr char explorerActionName[] = "ME_NATIVE_LIBRARY_CACHE_EXPLORER_TOGGLE";
 constexpr wchar_t moduleName[] = L"reaper_explorer.dll";
-constexpr char originalDigest[] = "be5957206e14683ffe6557e8169d4dd92d04b5ec6eee8f758541948e8069f355";
-constexpr std::size_t refreshRva = 0x509b0;
-constexpr std::size_t parseRva = 0x0f9b4;
-constexpr std::size_t sortRva = 0x14630;
-constexpr std::size_t compareRva = 0x16620;
-constexpr std::size_t modelRva = 0x10e0a0;
 constexpr std::uint64_t minimumLibrarySize = 50ULL * 1024 * 1024;
+
+struct NativeProfile {
+    const char* version;
+    const char* digest;
+    const wchar_t* cacheFolder;
+    std::size_t fileSize;
+    std::size_t refresh, parse, sort, compare, model;
+    std::size_t column, reverse, listFlags, explorerFlags;
+    std::size_t allocate, release, releaseRecord, setUserTag;
+    std::array<std::size_t, 7> refreshSites;
+    std::size_t parseSite, sortSite;
+};
+
+constexpr NativeProfile profiles[]{
+    {
+        "7.82/x64", "be5957206e14683ffe6557e8169d4dd92d04b5ec6eee8f758541948e8069f355", L"", 1188352,
+        0x509b0, 0x0f9b4, 0x14630, 0x16620, 0x10e0a0,
+        0x10f8a4, 0x10f8a8, 0x10f8d4, 0x10b124,
+        0xb8de0, 0xb8280, 0x17590, 0x10fb8,
+        {0x150c3, 0x3e778, 0x4876f, 0x4d8b0, 0x4e26b, 0x61281, 0xaa04f},
+        0x51087, 0x51cce
+    },
+    {
+        "7.86/x64", "5d5d50cd241551bb28438c59a87376b85095105d4151477783728038eff08b7e", L"7.86", 1185280,
+        0x4c648, 0x0b004, 0x0fc80, 0x11cd0, 0x10e040,
+        0x10f814, 0x10f818, 0x10f810, 0x10afd8,
+        0xb8780, 0xb8460, 0x12c40, 0x0c608,
+        {0x10713, 0x3a297, 0x44417, 0x49558, 0x49f13, 0x5d029, 0xa5d57},
+        0x4cd1f, 0x4d966
+    },
+};
 
 using Address = std::uintptr_t;
 using Refresh = void(*)(void*, unsigned, const void*, const void*);
@@ -84,6 +109,7 @@ struct Patch {
 };
 
 std::byte* explorer = nullptr;
+const NativeProfile* profile = nullptr;
 DWORD uiThread = 0;
 void* relayPage = nullptr;
 std::size_t installed = 0;
@@ -222,8 +248,8 @@ double durationMs(Clock::time_point start)
 
 SortSettings readSortSettings()
 {
-    return {*native<const int*>(0x10f8a4), *native<const char*>(0x10f8a8) != 0,
-        *native<const unsigned*>(0x10f8d4), *native<const unsigned*>(0x10b124)};
+    return {*native<const int*>(profile->column), *native<const char*>(profile->reverse) != 0,
+        *native<const unsigned*>(profile->listFlags), *native<const unsigned*>(profile->explorerFlags)};
 }
 
 void clearOrder()
@@ -252,8 +278,8 @@ void publishState()
 
 void refreshHook(void* model, unsigned flags, const void* selection, const void* scroll)
 {
-    const auto refresh = native<Refresh>(refreshRva);
-    if (GetCurrentThreadId() != uiThread || !enabled || model != explorer + modelRva) {
+    const auto refresh = native<Refresh>(profile->refresh);
+    if (GetCurrentThreadId() != uiThread || !enabled || model != explorer + profile->model) {
         refresh(model, flags, selection, scroll);
         return;
     }
@@ -275,7 +301,7 @@ void refreshHook(void* model, unsigned flags, const void* selection, const void*
 
 bool parseHook(const char* path, void* records, void* roots)
 {
-    const auto parse = native<Parse>(parseRva);
+    const auto parse = native<Parse>(profile->parse);
     if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || currentLoad->reentered
         || records != &currentLoad->view.records() || roots != &currentLoad->view.roots()) {
         return parse(path, records, roots);
@@ -298,10 +324,10 @@ bool parseHook(const char* path, void* records, void* roots)
     lastWriteMs = 0.0;
     lastRead = {};
     const media_cache::NativeApi api{
-        native<void*(*)(std::size_t)>(0xb8de0),
-        native<void(*)(void*)>(0xb8280),
-        native<void(*)(void*)>(0x17590),
-        native<void(*)(void*, const char*, const char*, char)>(0x10fb8)
+        native<void*(*)(std::size_t)>(profile->allocate),
+        native<void(*)(void*)>(profile->release),
+        native<void(*)(void*)>(profile->releaseRecord),
+        native<void(*)(void*, const char*, const char*, char)>(profile->setUserTag)
     };
     try {
         auto readSnapshot = [&](const std::filesystem::path& file) {
@@ -376,11 +402,11 @@ void rememberOrder(const Load& load, std::size_t count, const SortSettings& sett
 
 void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare)
 {
-    const auto sort = native<Sort>(sortRva);
+    const auto sort = native<Sort>(profile->sort);
     if (GetCurrentThreadId() != uiThread || !enabled || !currentLoad || !currentLoad->parsed
         || currentLoad->reentered || !data
         || stride != sizeof(void*) || count == 0 || count > media_cache::maxBufferRows
-        || compare != native<Compare>(compareRva)) {
+        || compare != native<Compare>(profile->compare)) {
         sort(data, count, stride, compare);
         return;
     }
@@ -430,17 +456,17 @@ void sortHook(void* data, std::size_t count, std::size_t stride, Compare compare
     if (enabled && !load.reentered) rememberOrder(load, count, settings);
 }
 
-std::array<Patch, 9> patches{{
-    {0x150c3, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x3e778, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x4876f, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x4d8b0, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x4e26b, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x61281, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0xaa04f, refreshRva, reinterpret_cast<Address>(refreshHook)},
-    {0x51087, parseRva, reinterpret_cast<Address>(parseHook)},
-    {0x51cce, sortRva, reinterpret_cast<Address>(sortHook)},
-}};
+std::array<Patch, 9> patches{};
+
+void preparePatches()
+{
+    std::size_t i = 0;
+    for (const auto site : profile->refreshSites) {
+        patches[i++] = {site, profile->refresh, reinterpret_cast<Address>(refreshHook)};
+    }
+    patches[i++] = {profile->parseSite, profile->parse, reinterpret_cast<Address>(parseHook)};
+    patches[i] = {profile->sortSite, profile->sort, reinterpret_cast<Address>(sortHook)};
+}
 
 bool expectedImage(HMODULE module)
 {
@@ -448,12 +474,12 @@ bool expectedImage(HMODULE module)
     const DWORD length = GetModuleFileNameW(module, path, DWORD(std::size(path)));
     if (!length || length >= std::size(path)) return false;
     std::ifstream file(std::filesystem::path(path), std::ios::binary | std::ios::ate);
-    if (!file || file.tellg() != 1188352) return false;
-    std::vector<unsigned char> bytes(1188352);
+    if (!file || file.tellg() != std::streamoff(profile->fileSize)) return false;
+    std::vector<unsigned char> bytes(profile->fileSize);
     file.seekg(0);
     if (!file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) return false;
 
-    return sha256Hex(bytes.data(), ULONG(bytes.size())) == originalDigest;
+    return sha256Hex(bytes.data(), ULONG(bytes.size())) == profile->digest;
 }
 
 void* allocateNearby()
@@ -554,6 +580,7 @@ void timer()
         }
         explorer = reinterpret_cast<std::byte*>(module);
         uiThread = GetCurrentThreadId();
+        preparePatches();
         // Keep the hook code resident even if the host unloads extensions
         // before the original module during shutdown.
         HMODULE pinned{};
@@ -654,14 +681,25 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         const auto getState = reinterpret_cast<const char*(*)(const char*, const char*)>(info->GetFunc("GetExtState"));
         setState = reinterpret_cast<SetState>(info->GetFunc("SetExtState"));
         refreshToolbar = reinterpret_cast<RefreshToolbar>(info->GetFunc("RefreshToolbar2"));
-        if (!getResource || !getVersion || !getState || !setState
-            || std::strcmp(getVersion(), "7.82/x64") != 0) return 0;
+        if (!getResource || !getVersion || !getState || !setState) return 0;
+        const auto* version = getVersion();
+        for (const auto& candidate : profiles) {
+            if (std::strcmp(version, candidate.version) == 0) {
+                profile = &candidate;
+                break;
+            }
+        }
+        if (!profile) return 0;
         const auto resource = utf8ToWide(getResource());
         if (resource.empty()) return 0;
         const std::filesystem::path root(resource);
         cacheDirectory = root / L"UserPlugins" / L"MEPlusNativeCache";
-        legacyDirectory = root / L"MEPlusNativeCache";
-        legacySource = (root / L"MediaDB" / L"06.ReaperFileList").lexically_normal();
+        if (*profile->cacheFolder) {
+            cacheDirectory /= profile->cacheFolder;
+        } else {
+            legacyDirectory = root / L"MEPlusNativeCache";
+            legacySource = (root / L"MediaDB" / L"06.ReaperFileList").lexically_normal();
+        }
         host = *info;
         enabled = std::strcmp(getState(section, "enabled"), "0") != 0;
         if (!registerActions() || !host.Register("timer", reinterpret_cast<void*>(timer))) {

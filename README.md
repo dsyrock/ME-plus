@@ -30,6 +30,12 @@ Windows 和 macOS 上如果读不到当前缩放范围，区段框会按整段�
 
 使用 `ME+: Show draggable audio regions` 开关功能，或用 `ME+: Configure audio region detection` 调整音量门限、静音时长与区段两端的留白。
 
+### 大型媒体库缓存
+
+在 Windows x64 的 REAPER 7.82 和 7.86 中，为达到 50 MiB 的媒体数据库自动缓存文件记录和排序索引，加快再次打开大型素材库及全库排序。缓存可跨 REAPER 重启复用，数据库更新或缓存失效时会自动重新建立。
+
+使用 `ME+: Toggle native library cache` 开关功能。缓存保存在 REAPER 资源目录的 `UserPlugins/MEPlusNativeCache`。小型数据库继续使用 REAPER 原生加载流程。
+
 ## 构建
 
 在 Windows 上安装 CMake 3.24 或更高版本、Visual Studio 2022 的 C++ 桌面工具和 Windows SDK。在项目根目录运行

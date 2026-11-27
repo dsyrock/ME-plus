@@ -902,6 +902,7 @@ bool load(HINSTANCE,reaper_plugin_info_t& info) {
      !loadApi(SetExtState,"SetExtState")||!loadApi(GetToggleState,"GetToggleCommandStateEx")||
      !loadApi(IsMediaExtension,"IsMediaExtension")||!loadApi(GetPeakFileNameEx,"GetPeakFileNameEx")||
      !loadApi(ClearPeakCache,"ClearPeakCache"))return false;
+  loadApi(previewSeek.getPreviewInfo,"MediaExplorerGetLastPlayedFileInfo");
   enabled=std::string(GetExtState(section,"enabled"))!="0";
   colors.get=GetExtState;colors.set=SetExtState;colors.load();colors.changed=[] {clearBitmaps();invalidate();statusDirty=true;};
   waveOrder=layoutSetting("wave_order",-1,65535);

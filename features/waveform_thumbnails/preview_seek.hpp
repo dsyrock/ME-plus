@@ -70,11 +70,42 @@ class PreviewSeek {
   uint64_t gestureAt=0;
 #endif
 public:
+#ifdef _WIN32
+  using PreviewInfo=bool (*)(char*,int,int*,double*,double*,double*,double*,double*,double*,char*,int);
+  PreviewInfo getPreviewInfo=nullptr;
+#endif
   uint64_t requests=0,completed=0,cancelled=0;
   double lastRatio=0;
   std::string lastPath,error;
   bool pending()const{return !pendingPath.empty();}
   const std::string& path()const{return pendingPath;}
+  bool previewMatches(HWND root) const {
+    const auto requested=std::filesystem::u8path(pendingPath);
+#ifdef _WIN32
+    if(getPreviewInfo){
+      std::array<char,32768> file{};
+      int mode=0;
+      double start=0,end=0,pitch=0,volume=0,rate=0,bpm=0;
+      char extra[1]{};
+      if(!getPreviewInfo(file.data(),int(file.size()),&mode,&start,&end,&pitch,&volume,&rate,&bpm,extra,int(sizeof(extra)))||!file[0])
+        return false;
+      const auto actualPath=std::filesystem::u8path(file.data()).lexically_normal().wstring();
+      const auto wantedPath=requested.lexically_normal().wstring();
+      return CompareStringOrdinal(actualPath.c_str(),-1,wantedPath.c_str(),-1,TRUE)==CSTR_EQUAL;
+    }
+#endif
+    const auto label=previewText(GetDlgItem(root,1014));
+    const auto name=requested.filename().u8string();
+    if(label.find(name)!=std::string::npos)return true;
+#ifdef _WIN32
+    // Static controls escape ampersands that would otherwise be accelerators.
+    std::string escaped;
+    for(char ch:name){escaped+=ch;if(ch=='&')escaped+='&';}
+    return escaped!=name&&label.find(escaped)!=std::string::npos;
+#else
+    return false;
+#endif
+  }
   bool request(const std::string& file,double fraction,uint64_t time) {
     if(!waveformPath(file)||!std::isfinite(fraction))return false;
     pendingPath=file;ratio=std::clamp(fraction,0.0,1.0);requestedAt=time;
@@ -123,9 +154,8 @@ public:
     }
     // Allow the native preview pane to finish installing the new source.
     if(time-openedAt<100)return false;
-    HWND wave=GetDlgItem(root,1046),label=GetDlgItem(root,1014);
-    auto name=std::filesystem::u8path(pendingPath).filename().u8string();
-    if(!wave||previewText(label).find(name)==std::string::npos||previewText(GetDlgItem(root,1016)).empty())return false;
+    HWND wave=GetDlgItem(root,1046);
+    if(!wave||!previewMatches(root)||previewText(GetDlgItem(root,1016)).empty())return false;
     RECT bounds{};GetClientRect(wave,&bounds);
     int width=int(bounds.right-bounds.left),height=int(bounds.bottom-bounds.top);
     if(width<16||height<1){error="Expand the native Media Explorer preview panel to seek";cancel();return true;}
@@ -139,6 +169,7 @@ public:
 #ifdef _WIN32
     // Some native waveform gestures can start playback themselves. Stop that
     // preview while it is still muted, then play from the saved seek position.
+    if(!mute||!pending())return false;
     mute->stop();
     mute.reset();
 #endif
